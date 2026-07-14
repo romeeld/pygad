@@ -64,7 +64,7 @@ class Spectrum(object):
         if vel is not None:
             wave = lambda_rest * (redshift + 1.0) * (1.0 + vel / float(c.in_units_of('km/s')))
         elif wave is not None:
-            vel = wave / (lambda_rest * (redshift + 1.0)) * float(c.in_units_of('km/s')) - 1.0
+            vel = l / (lambda_rest * (redshift + 1.0)) * float(c.in_units_of('km/s')) - 1.0
         else:
             print('One of l or vel must be provided.')
             exit
@@ -183,8 +183,10 @@ class Spectrum(object):
         flux = self.fluxes
         noise = self.noise
         starting_pixel = np.argmax(flux)
-        flux = np.concatenate((flux[starting_pixel:-1], flux[0 : starting_pixel + 1]))
-        noise = np.concatenate((noise[starting_pixel:-1], noise[0 : starting_pixel + 1]))
+        flux  = np.concatenate((flux[starting_pixel:],  flux[:starting_pixel]))
+        noise = np.concatenate((noise[starting_pixel:], noise[:starting_pixel]))
+        #flux = np.concatenate((flux[starting_pixel:-1], flux[0 : starting_pixel + 1]))
+        #noise = np.concatenate((noise[starting_pixel:-1], noise[0 : starting_pixel + 1]))
         if environment.verbose >= environment.VERBOSE_TACITURN:
             print("Periodically wrapping spectrum, starting_pixel= %d" % starting_pixel)
     
@@ -1522,7 +1524,7 @@ def write_line_list(spec_name, line_list, regions_l, regions_i):
     dN = line_list["dN"]
     b = line_list["b"]
     db = line_list["db"]
-    l = dl = line_list["l"]
+    l = line_list["l"]
     dl = line_list["dl"]
     EW = line_list["EW"]
     chisq = line_list["Chisq"]
@@ -1534,7 +1536,7 @@ def write_line_list(spec_name, line_list, regions_l, regions_i):
         elif "lines" in hf.keys():
             del hf["lines"]
         lines = hf.create_group("line_list")
-        lines.create_dataset("region", data=np.array(N, dtype=int))
+        lines.create_dataset("region", data=np.array(line_list["region"], dtype=int))
         lines.create_dataset("logN", data=np.array(N))
         lines.create_dataset("dlogN", data=np.array(dN))
         lines.create_dataset("b", data=np.array(b))

@@ -32,6 +32,8 @@ from utils import read_h5_into_dict
 from scipy import signal
 plt.rcParams['text.usetex'] = False
 import scipy
+from scipy.optimize import minimize
+    
 
 
 def find_peaks(flux_data,wavelength_data,min_height,distance):
@@ -486,7 +488,55 @@ def fit_profiles_sat(
         bnd = np.append(bnd, np.array([l_bounds]), axis=0)
         return p, bnd
 
-    def _grow_line(ion_name, l, flux, noise, resid, l0, mode, i_line=None, floor_sigma=1.5, smooth_sigma=1., unsat_sigma=3., chisq_asym_thresh=-1):  # adds N, b, l for a new line at l by growing N, b
+    def _grow_line(ion_name, l, flux, noise, resid, l0, mode,
+               i_line=None, floor_sigma=1.5, smooth_sigma=1.,
+               unsat_sigma=3., chisq_asym_thresh=-1):
+
+        smoothed = scipy.ndimage.gaussian_filter1d(resid, smooth_sigma) if smooth_sigma > 0. else resid
+        if i_line is None:
+            i_line = np.argmin(smoothed)
+        l_line = l[i_line]
+    
+        # (saturated / unsaturated branch — unchanged) ...
+    
+        smoothed  = np.minimum(smoothed, 1.0)
+        floor     = smoothed - floor_sigma * noise
+    
+        N_range = np.linspace(logN_bounds[0], logN_bounds[1], 40)
+        b_range = np.logspace(np.log10(b_bounds[0]), np.log10(b_bounds[1]), 40)
+    
+        best_chisq = 1.e20
+        best_N, best_b = logN_bounds[0], b_bounds[0]
+    
+        for bpar in b_range:
+            # ── KEY OPTIMISATION: compute profile shape once per b value ──
+            tau_unit = model_tau(ion_name, [0.0, bpar, l_line], l, mode)  # logN=0 → N=1
+    
+            for Ncol in N_range:
+                tau_trial = (10.0 ** Ncol) * tau_unit          # linear scaling, no model call
+                model_flux = np.exp(-np.clip(tau_trial, -50, 50))
+                diff = model_flux - floor
+                if np.any(diff < 0):
+                    continue                                    # line too strong
+    
+                # chi-sq near line core only
+                i_mid = i_line
+                i_lo  = i_mid
+                while i_lo > 0           and (1.-model_flux[i_lo])  > 0.5*(1.-model_flux[i_mid]): i_lo -= 1
+                i_hi  = i_mid
+                while i_hi < len(l) - 2  and (1.-model_flux[i_hi])  > 0.5*(1.-model_flux[i_mid]): i_hi += 1
+                sl = slice(i_lo, i_hi + 1)
+                dx = (resid[sl] - model_flux[sl]) / noise[sl]
+                nz = np.count_nonzero(dx)
+                if nz == 0:
+                    continue
+                chi2 = np.sum(dx * dx) / nz
+                if chi2 < best_chisq:
+                    best_chisq, best_N, best_b = chi2, Ncol, bpar
+
+        return best_N, best_b, l_line
+
+    def _grow_line_old(ion_name, l, flux, noise, resid, l0, mode, i_line=None, floor_sigma=1.5, smooth_sigma=1., unsat_sigma=3., chisq_asym_thresh=-1):  # adds N, b, l for a new line at l by growing N, b
         # compute location of new line, if pixel value not specified in i_line
         if smooth_sigma > 0.:
             smoothed = scipy.ndimage.gaussian_filter1d(resid, smooth_sigma)
@@ -538,7 +588,6 @@ def fit_profiles_sat(
                 #print(bpar,Ncol,l[0],l[-1],model[0],model[-1],floor[0],floor[-1])
                 diff = model-floor
                 # Save the largest line that satisfies the condition model>floor everywhere 
-                n_exceed = sum(d<0 for d in diff)
                 if np.any(diff<0):
                     #print('Cannot add:',bpar,Ncol,np.min(diff), np.argmin(diff), l[np.argmin(diff)], n_exceed)
                     #print(diff)
@@ -586,8 +635,6 @@ def fit_profiles_sat(
     }
 
     # loop over regions
-    from scipy.optimize import minimize
-    
     sat_regions = False
     
     for ireg in range(len(regions_l)):
@@ -918,8 +965,7 @@ def fit_profiles_sat(
             if chisq_soln > chisq_accept:
                 print( "Region %d: WARNING large chisq=%.3f > %.3f; check fit" % (ireg, chisq_soln, chisq_accept))
 
-    # Now look at entire spectrum and set of lines to see if the strengths should be reduced slightly.
-    # This is because fitting each region separately can result in cumulative excess absorption  overall.
+    # Now look at entire spectrum vs. full model to see if any lines can be removed/combined/reduced
     n_lines = len(line_list["N"])
     params = []
     for ip in range(n_lines):
@@ -929,9 +975,55 @@ def fit_profiles_sat(
         params.append(line_list["l"][ip])
     params = np.array(params)
     chisq_soln = _chisq(params, l, flux, noise, ion_name, chisq_asym_thresh, mode)
-    print("overall chisq=%g for %d lines" % (chisq_soln, n_lines))
 
-    # try reducing columns 
+    # Try to remove lines if it improves chisq
+    while n_lines > 1:
+        for i in range(n_lines):
+            trial_params = params.copy()
+            i_del = i
+            trial_params = np.delete(trial_params, [i_del, i_del+1, i_del+2], axis=0)
+            chisq_trial = _chisq(trial_params, l, flux, noise, ion_name, chisq_asym_thresh, mode)
+            delta_chisq = abs(chisq_trial-chisq_soln)/chisq_trial
+            if chisq_trial < chisq_soln:
+                if verbose:
+                    print("Full spectrum: Removed line %d (N=%g): chisq=%g, chisq_old=%g"%(i_del, params[3*i], chisq_trial, chisq_soln))
+                params = trial_params.copy()
+                chisq_soln = chisq_trial
+                n_lines = int(len(params)/3)
+                break
+            else:
+                continue
+        if i >= n_lines-2:
+            break
+
+    # Try combining adjacent lines if it improves the fit.
+    while n_lines > 1:
+        for i in range(n_lines-1):
+            trial_params = params.copy()
+            # Combines lines i and i+1
+            ip = 3*i
+            ip1 = 3*(i+1)
+            N_i = 10**params[ip]
+            N_i1 = 10**params[ip1]
+            trial_params[ip] = np.log10(N_i + N_i1)
+            trial_params[ip+1] = (N_i * params[ip+1] + N_i1 * params[ip+4]) / (N_i + N_i1)
+            trial_params[ip+2] = (N_i * params[ip+2] + N_i1 * params[ip+5]) / (N_i + N_i1)
+            trial_params = np.delete(trial_params, [ip+3, ip+4, ip+5], axis=0)
+            chisq_trial = _chisq(trial_params, l, flux, noise, ion_name, chisq_asym_thresh, mode)
+            delta_chisq = abs(chisq_trial-chisq_soln)/chisq_trial
+            if chisq_trial < chisq_soln:
+                if verbose:
+                    print("Full spectrum: Combining lines %d and %d (N=%g and %g): chisq=%g, chisq_old=%g"%(i, i+1, N_i, N_i1, chisq_trial, chisq_soln))
+                params = trial_params.copy()
+                chisq_soln = chisq_trial
+                n_lines = int(len(params)/3)
+                break
+            else:
+                continue
+        if i >= n_lines-2:
+            break
+
+    # Try reducing columns. This can work because fitting each region separately can result in cumulative excess absorption  overall.
     chisq_trial = 0.
     f_reduce = 0.999
     while chisq_trial < chisq_soln:
@@ -944,6 +1036,11 @@ def fit_profiles_sat(
             if verbose:
                 print(f"Multiplying all column densities by %d improves overall fit from chisq=%g to %g" % (f_reduce, chisq_soln, chisq_trial))
             params = trial_params.copy()
+            chisq_soln = chisq_trial
+
+    n_lines = int(len(params)/3)
+    if verbose:
+        print(f"Full spectrum: FINAL FIT {n_lines} lines in %d regions, chisq=%.3f"%(len(regions_l), chisq_soln))
 
     return line_list
 
@@ -1118,177 +1215,6 @@ def find_regions(
         for i in range(len(regions_l)):
             print(i, regions_l[i][0],'-',regions_l[i][1],'  pixels:', regions_i[i][0],'-',regions_i[i][1])
     return np.array(regions_l), np.array(regions_i)
-
-
-def find_regions_clara(
-    wavelengths, fluxes, noise, min_region_width=2, N_sigma=10.0, extend=False, buffer=2, det_flag=False, verbose=False
-):
-    """
-    Finds detection regions above some detection threshold and minimum width.
-
-    Args:
-        wavelengths (numpy array)
-        fluxes (numpy array):   Flux values at each wavelength
-        noise (numpy array):    Noise value at each wavelength
-        min_region_width (int): Minimum width of a detection region (pixels)
-        N_sigma (float):        Detection threshold (std deviations)
-        extend (boolean):       Option to extend detected regions until tau
-                                returns to continuum. Default=False
-        buffer (int):           Extend region by this many pixels
-        verbose (boolean):      Verbosity of output to screen
-
-    Returns:
-        regions_l (numpy array): contains subarrays with start and end wavelengths
-        regions_i (numpy array): contains subarrays with start and end indices
-    """
-
-    num_pixels = len(wavelengths)
-    pixels = range(num_pixels)
-    min_pix = 1
-    max_pix = num_pixels - 1
-
-    flux_ews = [0.0] * num_pixels
-    noise_ews = [0.0] * num_pixels
-    det_ratio = [-float("inf")] * num_pixels
-
-    # flux_ews has units of wavelength since flux is normalised. so we can use it for optical depth space
-    for i in range(min_pix, max_pix):
-        flux_dec = 1.0 - fluxes[i]
-        if flux_dec < noise[i]:
-            flux_dec = 0.0
-        flux_ews[i] = 0.5 * abs(wavelengths[i - 1] - wavelengths[i + 1]) * flux_dec
-        noise_ews[i] = 0.5 * abs(wavelengths[i - 1] - wavelengths[i + 1]) * noise[i]
-
-    # dev: no need to set end values = 0. since loop does not set end values
-    flux_ews[0] = 0.0
-    noise_ews[0] = 0.0
-
-    # Range of standard deviations for Gaussian convolution
-    std_min = 2
-    std_max = 11
-
-    # Convolve varying-width Gaussians with equivalent width of flux and noise
-    xarr = np.array([p - (num_pixels - 1) / 2.0 for p in range(num_pixels)])
-
-    # this part can remain the same, since it uses EW in wavelength units, not flux
-    for std in range(std_min, std_max):
-
-        gaussian = np.exp(-0.5 * (xarr / std) ** 2)
-
-        flux_func = np.convolve(flux_ews, gaussian, "same")
-        noise_func = np.convolve(np.square(noise_ews), np.square(gaussian), "same")
-        noise_func = 1.0 / np.sqrt(noise_func)
-
-        # Select highest detection ratio of the Gaussians
-        for i in range(min_pix, max_pix):
-            if flux_func[i] * noise_func[i] > det_ratio[i]:
-                det_ratio[i] = flux_func[i] * noise_func[i]
-            #if i < min_pix + 5: 
-            #    print(std, i, flux_func[i], noise_func[i], det_ratio[i])
-
-    if det_flag:
-        return [], [], det_ratio
-
-    # Select regions based on detection ratio at each point, combining nearby regions
-    start = 0
-    region_endpoints = []
-    for i in range(num_pixels):
-        if start == 0 and det_ratio[i] > 0 and fluxes[i] < 1.0 + noise[i]:  ##greater 0
-            start = i
-        elif start != 0 and (det_ratio[i] < 0 or fluxes[i] > 1.0 + noise[i]):
-            #if (i - start) > min_region_width:
-            end = i
-            region_endpoints.append([start, end])
-            start = 0
-
-    significant_region_endpoints = []
-    for reg in region_endpoints:    
-       
-        det_ratio = np.array(det_ratio)
-        significance = np.sqrt(np.sum(det_ratio[reg[0]:reg[1]]**2))
-       # if reg[1]-reg[0] >10:
-            #print(reg)
-            #print(significance)
-            #plt.plot(wavelengths[reg],fluxes[reg])
-
-        if significance == np.inf:
-            significance = 0
-        if significance > N_sigma: # and reg[1]>60 and reg[0]< (len(fluxes)-60):
-            significant_region_endpoints.append(reg)
-    # made extend a kwarg option
-    # lines may not go down to 0 again before next line starts
-
-    if extend:
-        # Expand edges of region until flux goes above 1
-        regions_expanded = []
-        for reg in significant_region_endpoints:
-            start = reg[0]
-            i = start
-            while i > 0 and fluxes[i] < 1.0:
-                i -= 1
-            start_new = i
-            end = reg[1]
-            j = end
-            while j < (len(fluxes) - 1) and fluxes[j] < 1.0:
-                j += 1
-            end_new = j
-            regions_expanded.append([start_new, end_new])
-
-    else:
-        regions_expanded = significant_region_endpoints
-
-    # Change to return the region indices
-    # Combine overlapping regions, check for detection based on noise value
-    # and extend each region again by a buffer
-    regions_l = []
-    regions_i = []
-    buffer = buffer
-    for i in range(len(regions_expanded)-1):
-        #print(len(regions_expanded),i)
-        if len(regions_expanded) == i:
-            break
-        start = regions_expanded[i][0]
-        end = regions_expanded[i][1]
-        #print(start,end)
-        #print(regions_expanded[i+1])
-        #print('difference'+str(regions_expanded[i+1][0]-end))
-        if len(regions_expanded) == i+1:
-            break
-        if (regions_expanded[i+1][0]-end) < 5:
-            regions_expanded[i][1] = regions_expanded[i+1][1]
-            regions_expanded=np.delete(regions_expanded,(i+1),axis=0)
-        #print(regions_expanded)
-        
-        end_init = end
-    for i in range(len(regions_expanded)):
-        
-        start = regions_expanded[i][0]
-        end = regions_expanded[i][1]
-        # TODO: this part seems to merge regions if they overlap - try printing this out to see if it can be modified to not merge regions?
-        #print((len(regions_expanded) - 1), regions_expanded[i + 1][0],end)
-        #if i < (len(regions_expanded) - 1) and end > regions_expanded[i + 1][0]:
-        #    end = regions_expanded[i + 1][1]
-        #    print('merged')
-            
-        for j in range(start, end):
-            
-            flux_dec = 1.0 - fluxes[j]
-            #if flux_dec > abs(noise[j]):# * N_sigma:
-            if start >= buffer:
-                start -= buffer
-            if end < len(wavelengths) - buffer:
-                end += buffer
-            regions_l.append([wavelengths[start], wavelengths[end]])
-            regions_i.append([start, end])
-            
-            break
-    
-    if verbose:
-        print("Found {} detection regions:".format(len(regions_l)))
-        for i in range(len(regions_l)):
-            print('%d  lambda: %.9g-%.9g  pixels: %g-%g' % (i, regions_l[i][0], regions_l[i][1], regions_i[i][0], regions_i[i][1]))
-    return np.array(regions_l), np.array(regions_i), det_ratio
-
 
 
 
@@ -1477,13 +1403,13 @@ def EquivalentWidth(fluxes, waves):
     Returns:
         Equivalent width in units of waves.
     """
-    dEW = np.zeros(len(fluxes))
-    for i in range(1, len(fluxes) - 1):
-        dEW[i] = (1.0 - fluxes[i]) * abs(waves[i + 1] - waves[i - 1]) * 0.5
-    dEW[0] = (1.0 - fluxes[0]) * abs(waves[1] - waves[0])
-    dEW[i - 1] = (1.0 - fluxes[i - 1]) * abs(waves[i - 1] - waves[i - 2])
-    return np.sum(dEW)
-
+    fluxes = np.asarray(fluxes, dtype=float)
+    waves  = np.asarray(waves,  dtype=float)
+    dwave          = np.empty_like(waves)
+    dwave[1:-1]    = 0.5 * np.abs(waves[2:] - waves[:-2])
+    dwave[0]       = np.abs(waves[1]  - waves[0])
+    dwave[-1]      = np.abs(waves[-1] - waves[-2])
+    return float(np.sum((1.0 - fluxes) * dwave))
 
 def write_line_list(spec_name, line_list, regions_l, regions_i):
     """

@@ -39,9 +39,9 @@ from physics import wave_to_vel, vel_to_wave, tau_to_flux
 from utils import read_h5_into_dict
 from scipy import signal
 import scipy
-from scipy.optimize import minimize
+from scipy.optimize import minimize, NonlinearConstraint
 plt.rcParams['text.usetex'] = False
-    
+
 
 def find_peaks(flux_data,wavelength_data,min_height,distance):
 
@@ -301,7 +301,7 @@ class Spectrum(object):
 
     def fit_profiles(self, vel_range, do_continuum_buffer=True, nbuffer=50, 
                      snr_default=30., chisq_lim=2.0, chisq_unacceptable=25, 
-                     chisq_asym_thresh=-1., chisq_factor=0.95, max_lines=12):
+                     chisq_factor=0.95, N_sigma_constr=3.0, max_lines=12):
  
         # prepare the portion of the spectrum to fit
         # extract from full spectrum, wrap periodically, buffer with a continuum, set the noise level for fitting
@@ -312,12 +312,12 @@ class Spectrum(object):
 
         # fit profiles within each region (main routine)
         self.line_list = fit_profiles_sat(self.ion_name, self.waves_fit, self.fluxes_fit, self.noise_fit,
-                                              self.regions_l, self.regions_i,
-                                              chisq_lim=chisq_lim, chisq_factor=chisq_factor,
-                                              max_lines=max_lines, 
-                                              chisq_asym_thresh=chisq_asym_thresh, 
-                                              logN_bounds=self.logN_bounds, 
-                                              b_bounds=self.b_bounds, mode='Voigt', verbose=self.verbose)
+                                          self.regions_l, self.regions_i,
+                                          chisq_lim=chisq_lim, chisq_factor=chisq_factor,
+                                          chisq_unacceptable=chisq_unacceptable, N_sigma_constr=N_sigma_constr, 
+                                          max_lines=max_lines, 
+                                          logN_bounds=self.logN_bounds, 
+                                          b_bounds=self.b_bounds, mode='Voigt', verbose=self.verbose)
             
         # If necessary, unwrap wavelengths to return to original l values
         if self.wrap_pixel > 0:
@@ -384,8 +384,9 @@ def fit_profiles_sat(
     regions_i,
     chisq_lim=2,
     chisq_factor=0.95,
+    chisq_unacceptable=50.,
+    N_sigma_constr=3.0,
     max_lines=12,
-    chisq_asym_thresh=-1,
     mode="Voigt",
     logN_bounds=[8,20],
     b_bounds=[1, 300],
@@ -408,9 +409,6 @@ def fit_profiles_sat(
                             If <0, then the value used is abs(chisq_lim)+0.1*n_lines,
                             where n_lines is the number of lines for that trial.
         chisq_factor (float):  Factor (<=1) by which chisq must improve to accept added line.
-        chisq_asym_thresh (float): Penalize more heavily for model_flux exceeding flux when
-                            flux is more than chisq_asym above noise (smaller=more penalty).
-                            Default -1 means normal chisq (no penalty); set >=0 to turn on.
         max_lines (int):    Maximum number of lines allowed in a given detection
                             region, after which the fit declared done regardless of chisq.
                             If limit is hit, this may result in a poor fit.
@@ -428,6 +426,9 @@ def fit_profiles_sat(
 
     """
 
+    from .tau_lookup import get_tau_lookup, model_tau_fast
+    _lookup = get_tau_lookup(ion_name, mode)
+
     np.set_printoptions(formatter={'float': '{:.4f}'.format})
 
     #plt.plot(l,flux)
@@ -443,18 +444,8 @@ def fit_profiles_sat(
     def _tau_to_flux(tau):  # return flux from tau, avoiding over/underflow
         return np.exp(-np.clip(tau, -50, 50))
 
-    def _chisq_asym(p, l, flux, noise, ion_name, chisq_asym_thresh, mode):  # reduced chisq, suppressing saturated regions
-        #chisq_asym = -1.
-        model_flux = _tau_to_flux(model_tau(ion_name, p, l, mode))
-        dx_array = (flux - model_flux) / noise
-        if chisq_asym_thresh >= 0:
-            # penalize more heavily for model_flux >> flux (i.e. dx_array << 0) 
-            dx_array = np.where(dx_array > -chisq_asym_thresh, dx_array, dx_array - (dx_array - chisq_asym_thresh)**2)
-            dx_array = np.where(flux < 0., 0., dx_array)
-        return np.sum(dx_array * dx_array) / np.count_nonzero(dx_array)
-
-    def _chisq(p, l, flux, noise, ion_name, chisq_asym_thresh, mode):  # reduced chisq
-        model_flux = _tau_to_flux(model_tau(ion_name, p, l, mode))
+    def _chisq(p, l, flux, noise, ion_name, mode):  # reduced chisq
+        model_flux = _tau_to_flux(model_tau_fast(ion_name, p, l, mode))
         dx_array = (flux - model_flux) / noise
         #dx_array = np.where(flux < abs(noise), 0., dx_array)
         return np.sum(dx_array * dx_array) / np.count_nonzero(dx_array)
@@ -469,7 +460,7 @@ def fit_profiles_sat(
 
         if grow_line:
             # Grow line to max (N,b) allowed given the residual
-            n_guess, b_guess, l_guess = _grow_line(ion_name, l, flux, noise, resid, l0, mode, i_line=i_line, chisq_asym_thresh=chisq_asym_thresh)
+            n_guess, b_guess, l_guess = _grow_line(ion_name, l, flux, noise, resid, l0, mode, i_line=i_line)
         else:
             # Make an educated guess at the new line parameters
             b_guess = (
@@ -497,7 +488,7 @@ def fit_profiles_sat(
 
     def _grow_line(ion_name, l, flux, noise, resid, l0, mode,
                i_line=None, floor_sigma=1.5, smooth_sigma=1.,
-               unsat_sigma=3., chisq_asym_thresh=-1):
+               unsat_sigma=3.):
 
         smoothed = scipy.ndimage.gaussian_filter1d(resid, smooth_sigma) if smooth_sigma > 0. else resid
         if i_line is None:
@@ -517,7 +508,7 @@ def fit_profiles_sat(
     
         for bpar in b_range:
             # ── KEY OPTIMISATION: compute profile shape once per b value ──
-            tau_unit = model_tau(ion_name, [0.0, bpar, l_line], l, mode)  # logN=0 → N=1
+            tau_unit = model_tau_fast(ion_name, [0.0, bpar, l_line], l, mode)  # logN=0 → N=1
     
             for Ncol in N_range:
                 tau_trial = (10.0 ** Ncol) * tau_unit          # linear scaling, no model call
@@ -543,7 +534,7 @@ def fit_profiles_sat(
 
         return best_N, best_b, l_line
 
-    def _grow_line_old(ion_name, l, flux, noise, resid, l0, mode, i_line=None, floor_sigma=1.5, smooth_sigma=1., unsat_sigma=3., chisq_asym_thresh=-1):  # adds N, b, l for a new line at l by growing N, b
+    def _grow_line_old(ion_name, l, flux, noise, resid, l0, mode, i_line=None, floor_sigma=1.5, smooth_sigma=1., unsat_sigma=3.):  # adds N, b, l for a new line at l by growing N, b
         # compute location of new line, if pixel value not specified in i_line
         if smooth_sigma > 0.:
             smoothed = scipy.ndimage.gaussian_filter1d(resid, smooth_sigma)
@@ -591,7 +582,7 @@ def fit_profiles_sat(
                 if Ncol < N_min:
                     continue
                 p_trial = np.array([Ncol, bpar, l_line])
-                model = _tau_to_flux(model_tau(ion_name, p_trial, l, mode))
+                model = _tau_to_flux(model_tau_fast(ion_name, p_trial, l, mode))
                 #print(bpar,Ncol,l[0],l[-1],model[0],model[-1],floor[0],floor[-1])
                 diff = model-floor
                 # Save the largest line that satisfies the condition model>floor everywhere 
@@ -612,9 +603,6 @@ def fit_profiles_sat(
                     while (1.-model[i_hi]) > 0.5 * (1.-model[i_line]) and i_hi < len(model)-2: i_hi += 1
                     dx_array = (resid[i_lo:i_hi+1] - model[i_lo:i_hi+1]) / noise[i_lo:i_hi+1]
                     i_min = np.argmin(diff)
-                    if chisq_asym_thresh >= 0. and diff[i_min] > 1. - noise[i_min]:
-                        print("i=%d model=%g floor=%g diff=%g noise=%g", i_min, model[i_min], floor[i_min], diff[i_min], noise[i_min])
-                        dx_array = np.where(dx_array < -chisq_asym_thresh, dx_array - (dx_array+chisq_asym_thresh)*(dx_array+chisq_asym_thresh), dx_array)
                     chi2 = np.sum(dx_array * dx_array) / np.count_nonzero(dx_array)
                     chisq.append(chi2)
                     #print('Could add:',ion_name,bpar,Ncol,l_line,np.min(model),np.min(resid),chisq[-1])
@@ -625,8 +613,28 @@ def fit_profiles_sat(
         if n <= 5: return 100
         else: return max(50, 50+(nmax-n)*10)
 
-    # identify independent regions to fit within the spectrum
-    #regions_l, regions_i = find_regions(l, flux, noise)
+    def _model_flux(p):
+        return _tau_to_flux(model_tau_fast(ion_name, p, l_reg, mode, lookup=_lookup))
+
+    def _constraint_jac(p):
+        """
+        Jacobian of model_flux w.r.t. params p, shape (n_pixels, len(p)).
+        Uses central finite differences with step matched to float64 precision.
+        """
+        eps   = np.sqrt(np.finfo(float).eps)   # ~1.5e-8
+        n_p   = len(p)
+        n_pix = len(l_reg)
+        jac   = np.empty((n_pix, n_p))
+        f0    = _tau_to_flux(model_tau_fast(ion_name, p, l_reg, mode, lookup=_lookup))
+        for j in range(n_p):
+            dp       = np.zeros(n_p)
+            dp[j]    = eps * max(abs(p[j]), 1.0)
+            f_plus   = _tau_to_flux(model_tau_fast(ion_name, p + dp, l_reg, mode, lookup=_lookup))
+            jac[:, j] = (f_plus - f0) / dp[j]
+        return jac
+
+
+################ MAIN CODE FOR FITTING LINES 
 
     # dicts to store results
     line_list = {
@@ -645,7 +653,7 @@ def fit_profiles_sat(
     sat_regions = False
     
     for ireg in range(len(regions_l)):
-    #for ireg in range(0,3):
+    #for ireg in range(0,4):
     
         params = []
         bounds = []
@@ -705,7 +713,7 @@ def fit_profiles_sat(
                 for Ncol in N_range:
                     for bpar in b_range:
                         params = np.array([Ncol, bpar, middle_guess])
-                        chisq_soln = _chisq(params, l_reg_bounds, f_reg_bounds, n_reg_bounds, ion_name, chisq_asym_thresh, mode)
+                        chisq_soln = _chisq(params, l_reg_bounds, f_reg_bounds, n_reg_bounds, ion_name, mode)
                         if chisq_soln < chisq_best:
                             chisq_best = chisq_soln
                             Nbest = Ncol
@@ -725,24 +733,6 @@ def fit_profiles_sat(
                 else:
                     bounds_reg = np.append(bounds_reg, np.array(bounds))
             
-            
-            
-            ## re-compute the parameters for the full region with all saturated lines
-            '''
-            params_reg += 0.02 * (
-                2 * np.random.rand(len(params_reg)) - 1
-            )  # jiggle params and refit to compute hessian
-            soln = minimize(
-                chisq_fcn,
-                params_reg,
-                args=(l_reg, f_reg, n_reg, ion_name, chisq_asym_thresh, mode),
-                method="BFGS",
-                options={"maxiter": 100},
-            )
-            chisq_soln = _chisq(params_reg, l_reg, f_reg, n_reg, ion_name, chisq_asym_thresh, mode)
-            cov = soln.hess_inv  # covariance matrix of final soluiton
-            # append lines in this region onto line list
-            '''
             if verbose:
                 print(
                     "Saturated line gives full region %d (%g-%g): chisq= %g with %d lines"
@@ -800,7 +790,7 @@ def fit_profiles_sat(
                 params[-1] = params[-1] + delta_l * (0.5*np.random.rand() - 1)  
             n_lines = int(len(params) / 3)
             resid = 1.0 + f_reg - _tau_to_flux(model_tau(ion_name, params.flatten(), l_reg, mode))  # residual spectrum
-            chisq_soln = _chisq(params, l_reg, f_reg, n_reg, ion_name, chisq_asym_thresh, mode)
+            chisq_soln = _chisq(params, l_reg, f_reg, n_reg, ion_name, mode)
             if chisq_soln < chisq_best:
                 best_nlines = n_lines
                 best_params = params
@@ -814,7 +804,7 @@ def fit_profiles_sat(
                 params = np.delete(params, [-3, -2, -1], axis=0)
                 bounds = np.delete(bounds, [-3, -2, -1], axis=0)
                 n_lines = int(len(params) / 3)
-                chisq_soln = _chisq(params, l_reg, f_reg, n_reg, ion_name, chisq_asym_thresh, mode)
+                chisq_soln = _chisq(params, l_reg, f_reg, n_reg, ion_name, mode)
                 break
             chisq_old = chisq_soln
             if verbose:
@@ -832,22 +822,30 @@ def fit_profiles_sat(
             if not first_time:
                 params, bounds = _add_line(ion_name, params, bounds, l_reg, f_reg, n_reg, float(l0.split()[0]), mode)
                 n_lines = int(len(params) / 3)
+            # Do a constrained minimization, trying to keep the model above flux - N_sigma_constr * noise
             chisq_fcn = lambda *args: _chisq(*args)
+            constraint = NonlinearConstraint(
+                fun = _model_flux,
+                lb  = f_reg - N_sigma_constr * n_reg,  # lower bound per pixel
+                ub  = np.inf,                           # no upper bound on model flux
+                jac=_constraint_jac,
+            )
             soln = minimize(
                 chisq_fcn,
                 params,
                 bounds=bounds,
-                args=(l_reg, f_reg, n_reg, ion_name, chisq_asym_thresh, mode),
-                options={"maxiter": _maxiter(n_lines, max_lines)},
+                args=(l_reg, f_reg, n_reg, ion_name, mode),
+                method="trust-constr",
+                constraints = constraint,
+                options={"maxiter": _maxiter(n_lines, max_lines), "gtol": 1e-8},
             )
-            params = soln.x  # set params to new chisq-minimized values
-            cov = soln.hess_inv  # covariance matrix of final soluiton
-            chisq_soln = _chisq(params, l_reg, f_reg, n_reg, ion_name, chisq_asym_thresh, mode)
+            params = soln.x  # set params to new best-fit values
+            chisq_soln = _chisq(params, l_reg, f_reg, n_reg, ion_name, mode)
             if verbose and not first_time:
                 if first_time:
                     print( "Region %d: With %d lines after %d iters, chisq=%.3f" % (ireg, n_lines, soln.nit, chisq_soln))
                 else:
-                    print( "Region %d: Added new line %d, after %d iters, chisq=%.3f" % (ireg, n_lines, soln.nit, chisq_soln))
+                    print( "Region %d: Added new line %d (N=%g), after %d iters, chisq=%.3f" % (ireg, n_lines, params[-3], soln.nit, chisq_soln))
             first_time = False
             # Require non-trivial improvement
             if chisq_soln < chisq_factor * chisq_best:
@@ -857,6 +855,18 @@ def fit_profiles_sat(
                 chisq_best = chisq_soln
             # keep trying for small number of lines even if little improvement
             elif n_lines <= 2 and chisq_soln < chisq_best:
+                best_nlines = n_lines
+                best_params = params
+                best_bounds = bounds
+                chisq_best = chisq_soln
+                continue
+            # keep trying if chisq is very high
+            elif n_lines <= 6 and chisq_soln > chisq_unacceptable: 
+                if chisq_soln < chisq_best:
+                    best_nlines = n_lines
+                    best_params = params
+                    best_bounds = bounds
+                    chisq_best = chisq_soln
                 continue
             # if it's not improving enough reset to previous best params and stop
             else:
@@ -868,37 +878,38 @@ def fit_profiles_sat(
 
         # jiggle params and refit to compute hessian
         compute_errors = True
+        delta_params = [0.02, 0.05, 0.0001] * n_lines
         if compute_errors:
-            params_jiggled = params + 0.02 * ( 2 * np.random.rand(len(params)) - 1)  
+            params_jiggled = params + delta_params * ( 2 * np.random.rand(len(params)) - 1)  
             chisq_fcn = lambda *args: _chisq(*args)
             soln = minimize(
                 chisq_fcn,
                 params_jiggled,
-                args=(l_reg, f_reg, n_reg, ion_name, chisq_asym_thresh, mode),
+                args=(l_reg, f_reg, n_reg, ion_name, mode),
                 method="BFGS",
                 options={"maxiter": 100},
             )
             cov = soln.hess_inv  # covariance matrix of final soluiton
             # if jiggled param is better (shouldn't usually happen), then use that
-            chisq_trial = _chisq(params_jiggled, l_reg, f_reg, n_reg, ion_name, chisq_asym_thresh, mode)
-            if chisq_trial < chisq_best:
-                if verbose:
-                    print(f'Region {ireg}: Fit improved with jiggled params chisq={chisq_trial}')
-                params = soln.x
-                n_lines = int(len(params) / 3)
-                best_nlines = n_lines
-                best_params = params_jiggled
-                best_bounds = bounds
-                chisq_best = chisq_trial
+            #chisq_trial = _chisq(params_jiggled, l_reg, f_reg, n_reg, ion_name, mode)
+            #if chisq_trial < chisq_best:
+            #    if verbose:
+            #        print(f'Region {ireg}: Fit improved with jiggled params chisq={chisq_trial}')
+            #    params = soln.x
+            #    n_lines = int(len(params) / 3)
+            #    best_nlines = n_lines
+            #    best_params = params_jiggled
+            #    best_bounds = bounds
+            #    chisq_best = chisq_trial
 
         # remove small lines as long as chisq doesn't go up by much
         while n_lines > 1:
             for i in range(n_lines):
                 trial_params = params.copy()
                 #i_del = no.argmin(np.array([params[ip*3] for ip in np.arange(n_lines)]))
-                i_del = i
+                i_del = 3*i
                 trial_params = np.delete(trial_params, [i_del, i_del+1, i_del+2], axis=0)
-                chisq_trial = _chisq(trial_params, l_reg, f_reg, n_reg, ion_name, chisq_asym_thresh, mode)
+                chisq_trial = _chisq(trial_params, l_reg, f_reg, n_reg, ion_name, mode)
                 delta_chisq = abs(chisq_trial-chisq_best)/chisq_trial
                 if delta_chisq < 0.01 or chisq_trial < chisq_accept:
                     if verbose:
@@ -913,7 +924,7 @@ def fit_profiles_sat(
             if i >= n_lines-2:
                 break
 
-        # Try combining adjacent lines to minimize the number
+        # Try combining adjacent lines to lower the number
         while n_lines > 1:
             for i in range(n_lines-1):
                 trial_params = params.copy()
@@ -926,7 +937,7 @@ def fit_profiles_sat(
                 trial_params[ip+1] = (N_i * params[ip+1] + N_i1 * params[ip+4]) / (N_i + N_i1)
                 trial_params[ip+2] = (N_i * params[ip+2] + N_i1 * params[ip+5]) / (N_i + N_i1)
                 trial_params = np.delete(trial_params, [ip+3, ip+4, ip+5], axis=0)
-                chisq_trial = _chisq(trial_params, l_reg, f_reg, n_reg, ion_name, chisq_asym_thresh, mode)
+                chisq_trial = _chisq(trial_params, l_reg, f_reg, n_reg, ion_name, mode)
                 delta_chisq = abs(chisq_trial-chisq_best)/chisq_trial
                 if delta_chisq < 0.01 or chisq_trial < chisq_accept:
                     if verbose:
@@ -942,7 +953,7 @@ def fit_profiles_sat(
                 break
 
         # load final line list
-        chisq_soln = _chisq(params, l_reg, f_reg, n_reg, ion_name, chisq_asym_thresh, mode)
+        chisq_soln = _chisq(params, l_reg, f_reg, n_reg, ion_name, mode)
         for ip in np.arange(n_lines):
             line_list["region"] = np.append(line_list["region"], ireg)
             line_list["N"] = np.append(line_list["N"], params[ip * 3])
@@ -981,21 +992,23 @@ def fit_profiles_sat(
         params.append(line_list["b"][ip])
         params.append(line_list["l"][ip])
     params = np.array(params)
-    chisq_soln = _chisq(params, l, flux, noise, ion_name, chisq_asym_thresh, mode)
+    chisq_soln = _chisq(params, l, flux, noise, ion_name, mode)
 
+    """
     # Try to remove lines if it improves chisq
     while n_lines > 1:
         for i in range(n_lines):
             trial_params = params.copy()
-            i_del = i
+            i_del = 3*i
             trial_params = np.delete(trial_params, [i_del, i_del+1, i_del+2], axis=0)
-            chisq_trial = _chisq(trial_params, l, flux, noise, ion_name, chisq_asym_thresh, mode)
+            chisq_trial = _chisq(trial_params, l, flux, noise, ion_name, mode)
             delta_chisq = abs(chisq_trial-chisq_soln)/chisq_trial
             if chisq_trial < chisq_soln:
                 if verbose:
                     print("Full spectrum: Removed line %d (N=%g): chisq=%g, chisq_old=%g"%(i_del, params[3*i], chisq_trial, chisq_soln))
                 params = trial_params.copy()
                 chisq_soln = chisq_trial
+                line_tracker[i] = 0
                 n_lines = int(len(params)/3)
                 break
             else:
@@ -1016,19 +1029,21 @@ def fit_profiles_sat(
             trial_params[ip+1] = (N_i * params[ip+1] + N_i1 * params[ip+4]) / (N_i + N_i1)
             trial_params[ip+2] = (N_i * params[ip+2] + N_i1 * params[ip+5]) / (N_i + N_i1)
             trial_params = np.delete(trial_params, [ip+3, ip+4, ip+5], axis=0)
-            chisq_trial = _chisq(trial_params, l, flux, noise, ion_name, chisq_asym_thresh, mode)
+            chisq_trial = _chisq(trial_params, l, flux, noise, ion_name, mode)
             delta_chisq = abs(chisq_trial-chisq_soln)/chisq_trial
             if chisq_trial < chisq_soln:
                 if verbose:
                     print("Full spectrum: Combining lines %d and %d (N=%g and %g): chisq=%g, chisq_old=%g"%(i, i+1, N_i, N_i1, chisq_trial, chisq_soln))
                 params = trial_params.copy()
                 chisq_soln = chisq_trial
+                line_tracker[i+1] = 0
                 n_lines = int(len(params)/3)
                 break
             else:
                 continue
         if i >= n_lines-2:
             break
+    """
 
     # Try reducing columns. This can work because fitting each region separately can result in cumulative excess absorption  overall.
     chisq_trial = 0.
@@ -1037,7 +1052,7 @@ def fit_profiles_sat(
         chisq_trial = chisq_soln
         trial_params = params.copy()
         trial_params[::3] *= f_reduce
-        chisq_trial = _chisq(trial_params, l, flux, noise, ion_name, chisq_asym_thresh, mode)
+        chisq_trial = _chisq(trial_params, l, flux, noise, ion_name, mode)
         #print(chisq_trial, chisq_soln, trial_params[::3])
         if chisq_trial < chisq_soln:
             if verbose:
@@ -1048,6 +1063,8 @@ def fit_profiles_sat(
     n_lines = int(len(params)/3)
     if verbose:
         print(f"Full spectrum: FINAL FIT {n_lines} lines in %d regions, chisq=%.3f"%(len(regions_l), chisq_soln))
+        for ip in range(n_lines):
+            print(ip, params[3*ip], params[3*ip+1], params[3*ip+2])
 
     return line_list
 
@@ -1216,6 +1233,17 @@ def find_regions(
             regions_i.append([start, end])
 
             break
+
+    # combine regions if too overlapping 
+    while len(regions_l) > 100000:  # this is not used; gives too large regions
+        for i in range(len(regions_l)-1):
+            if regions_i[i][1] - buffer >= regions_i[i+1][0]:
+                print('removing overlapping reg: %d %d' % (regions_i[i][1]-buffer, regions_i[i+1][0]))
+                regions_i[i][1] = regions_i[i+1][1]
+                regions_l[i][1] = regions_i[i+1][1]
+                regions_l.pop(i+1)
+                regions_i.pop(i+1)
+                break
 
     if verbose:
         print('Found %d detection regions:' % len(regions_l))
@@ -1418,7 +1446,6 @@ def EquivalentWidth(fluxes, waves):
     dwave[-1]      = np.abs(waves[-1] - waves[-2])
     return float(np.sum((1.0 - fluxes) * dwave))
 
-
 def write_spectrum(
     spec_name,
     line,
@@ -1500,7 +1527,6 @@ def write_spectrum(
 
     return
 
-
 def write_line_list(spec_name, line_list, regions_l, regions_i):
     """
     Append profile fit information to spectrum file.  Spectrum file must exist
@@ -1547,7 +1573,8 @@ def write_line_list(spec_name, line_list, regions_l, regions_i):
 
     with h5py.File(spec_name, "a") as hf:
         if "line_list" in hf.keys():
-            print("Deleting and replacing line_list in %s" % spec_name)
+            if environment.verbose >= environment.VERBOSE_TACITURN:
+                print("Deleting and replacing line_list in %s" % spec_name)
             del hf["line_list"]
         elif "lines" in hf.keys():
             del hf["lines"]
@@ -1582,11 +1609,11 @@ def fit_profiles(
     chisq_lim=2.0,
     chisq_unacceptable=50.0,
     chisq_factor=0.95,
-    chisq_asym_thresh=-1.,
-    max_lines=10,
+    max_lines=15,
+    N_sigma_constr=3.0,
     mode="Voigt",
     logN_bounds=[12, 19],
-    b_bounds=[5, 200],
+    b_bounds=[0, 100],
 ):
     """
     Fit Voigt/other profiles to the given spectrum.  Begins with one
@@ -1614,11 +1641,11 @@ def fit_profiles(
                             fit and tries with a new set of lines.
         chisq_factor (float):  chi-square must improve by this factor with each
                             added line, otherwise trial line is not accepted.
-        chisq_asym_thresh (float):  penalize the model asymetrically when the model
-                            is more than this factor below the flux
         max_lines (int):    Maximum number of lines allowed in a given detection
                             region, after which the fit declared done regardless of chisq.
                             If limit is hit, this may result in a poor fit.
+        N_sigma_constr (float): Try to constrain minimizer to have model always above
+                            flux minus N_sigma_constr * noise
         mode (str):         Type of line profile: Gaussian/Lorentzian/Voigt;
                             see absorption_spectra.line_profile().
         logN_bounds (list): Initial log(column density) is restricted to this range
@@ -1661,16 +1688,16 @@ def fit_profiles(
         print('Must provide either spectrum_file or [wave,flux,noise,vel]')
         exit
 
-    logN_bounds = [12, 19]
-    # make a reasonable guess at b bounds
-    T = UnitScalar(1.e4, "K")
-    b_therm = thermal_b_param(line, T, "km/s")
-    b_bounds = [0.25*float(b_therm), 100]
+    # if not provided, make a reasonable guess at b bounds based on element
+    if b_bounds[0] == 0.:
+        T = UnitScalar(1.e4, "K")
+        b_therm = thermal_b_param(line, T, "km/s")
+        b_bounds = [0.25*float(b_therm), b_bounds[1]]
 
     gal_velocity_pos = None
 
     spec = Spectrum(line, redshift, l, flux, noise, vel, gal_velocity_pos=gal_velocity_pos, logN_bounds=logN_bounds, b_bounds=b_bounds)
-    spec.fit_profiles(vel_range=vel_range, chisq_lim=2.0, chisq_unacceptable=25, chisq_factor=0.95, chisq_asym_thresh=3.0, max_lines=12)
+    spec.fit_profiles(vel_range=vel_range, chisq_lim=chisq_lim, chisq_unacceptable=chisq_unacceptable, chisq_factor=chisq_factor, max_lines=max_lines, N_sigma_constr=N_sigma_constr)
     write_line_list(spectrum_file, spec.line_list, spec.regions_l, spec.regions_i)
     spec.plot_fit()
 

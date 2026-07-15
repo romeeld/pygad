@@ -861,13 +861,13 @@ def fit_profiles_sat(
                 chisq_best = chisq_soln
                 continue
             # keep trying if chisq is very high
-            elif n_lines <= 6 and chisq_soln > chisq_unacceptable: 
-                if chisq_soln < chisq_best:
-                    best_nlines = n_lines
-                    best_params = params
-                    best_bounds = bounds
-                    chisq_best = chisq_soln
-                continue
+            #elif n_lines <= 6 and chisq_soln > chisq_unacceptable: 
+            #    if chisq_soln < chisq_best:
+            #        best_nlines = n_lines
+            #        best_params = params
+            #        best_bounds = bounds
+            #        chisq_best = chisq_soln
+            #    continue
             # if it's not improving enough reset to previous best params and stop
             else:
                 params = best_params
@@ -984,19 +984,18 @@ def fit_profiles_sat(
                 print( "Region %d: WARNING large chisq=%.3f > %.3f; check fit" % (ireg, chisq_soln, chisq_accept))
 
     # Now look at entire spectrum vs. full model to see if any lines can be removed/combined/reduced
-    n_lines = len(line_list["N"])
-    params = []
-    for ip in range(n_lines):
-        #print(ip, n_lines, line_list["N"][ip], line_list["b"][ip], line_list["l"][ip])
-        params.append(line_list["N"][ip])
-        params.append(line_list["b"][ip])
-        params.append(line_list["l"][ip])
-    params = np.array(params)
-    chisq_soln = _chisq(params, l, flux, noise, ion_name, mode)
-
-    """
     # Try to remove lines if it improves chisq
+    n_lines = len(line_list["N"])
     while n_lines > 1:
+        params = []
+        for ip in range(n_lines):
+            #print(ip, n_lines, line_list["N"][ip], line_list["b"][ip], line_list["l"][ip])
+            params.append(line_list["N"][ip])
+            params.append(line_list["b"][ip])
+            params.append(line_list["l"][ip])
+        params = np.array(params)
+        chisq_soln = _chisq(params, l, flux, noise, ion_name, mode)
+
         for i in range(n_lines):
             trial_params = params.copy()
             i_del = 3*i
@@ -1004,12 +1003,11 @@ def fit_profiles_sat(
             chisq_trial = _chisq(trial_params, l, flux, noise, ion_name, mode)
             delta_chisq = abs(chisq_trial-chisq_soln)/chisq_trial
             if chisq_trial < chisq_soln:
-                if verbose:
-                    print("Full spectrum: Removed line %d (N=%g): chisq=%g, chisq_old=%g"%(i_del, params[3*i], chisq_trial, chisq_soln))
-                params = trial_params.copy()
+                line_list = {k: np.delete(v, i) for k, v in line_list.items()}
                 chisq_soln = chisq_trial
-                line_tracker[i] = 0
-                n_lines = int(len(params)/3)
+                n_lines = len(line_list["N"])
+                if verbose:
+                    print("Full spectrum: Removed line %d (N=%g), %d left: chisq=%g, chisq_old=%g"%(i_del, params[3*i], n_lines, chisq_trial, chisq_soln))
                 break
             else:
                 continue
@@ -1017,7 +1015,16 @@ def fit_profiles_sat(
             break
 
     # Try combining adjacent lines if it improves the fit.
+    n_lines = len(line_list["N"])
     while n_lines > 1:
+        params = []
+        for ip in range(n_lines):
+            params.append(line_list["N"][ip])
+            params.append(line_list["b"][ip])
+            params.append(line_list["l"][ip])
+        params = np.array(params)
+        chisq_soln = _chisq(params, l, flux, noise, ion_name, mode)
+
         for i in range(n_lines-1):
             trial_params = params.copy()
             # Combines lines i and i+1
@@ -1033,17 +1040,18 @@ def fit_profiles_sat(
             delta_chisq = abs(chisq_trial-chisq_soln)/chisq_trial
             if chisq_trial < chisq_soln:
                 if verbose:
-                    print("Full spectrum: Combining lines %d and %d (N=%g and %g): chisq=%g, chisq_old=%g"%(i, i+1, N_i, N_i1, chisq_trial, chisq_soln))
-                params = trial_params.copy()
+                    print("Full spectrum: Combined lines %d and %d (N=%g and %g): chisq=%g, chisq_old=%g"%(i, i+1, N_i, N_i1, chisq_trial, chisq_soln))
+                line_list["N"][i] = trial_params[ip]
+                line_list["b"][i] = trial_params[ip+1]
+                line_list["l"][i] = trial_params[ip+2]
+                line_list = {k: np.delete(v, i+1) for k, v in line_list.items()}
+                n_lines = len(line_list["N"])
                 chisq_soln = chisq_trial
-                line_tracker[i+1] = 0
-                n_lines = int(len(params)/3)
                 break
             else:
                 continue
         if i >= n_lines-2:
             break
-    """
 
     # Try reducing columns. This can work because fitting each region separately can result in cumulative excess absorption  overall.
     chisq_trial = 0.
@@ -1060,11 +1068,22 @@ def fit_profiles_sat(
             params = trial_params.copy()
             chisq_soln = chisq_trial
 
-    n_lines = int(len(params)/3)
+    # compute final chisq for entire spectrum
+    params = []
+    n_lines = len(line_list["N"])
+    for ip in range(n_lines):
+        #print(ip, n_lines, line_list["N"][ip], line_list["b"][ip], line_list["l"][ip])
+        params.append(line_list["N"][ip])
+        params.append(line_list["b"][ip])
+        params.append(line_list["l"][ip])
+    params = np.array(params)
+    chisq_soln = _chisq(params, l, flux, noise, ion_name, mode)
+
+    n_lines = len(line_list["N"])
     if verbose:
-        print(f"Full spectrum: FINAL FIT {n_lines} lines in %d regions, chisq=%.3f"%(len(regions_l), chisq_soln))
+        print(f"Full spectrum: FINAL FIT {n_lines} lines in %d regions, chisq=%.3f. Line list [i,N,b,l]:"%(len(regions_l), chisq_soln))
         for ip in range(n_lines):
-            print(ip, params[3*ip], params[3*ip+1], params[3*ip+2])
+            print(ip, line_list["N"][ip], line_list["b"][ip],line_list["l"][ip])
 
     return line_list
 

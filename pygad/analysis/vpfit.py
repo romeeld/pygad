@@ -13,28 +13,35 @@ usage:
 
 """
 
-from .absorption_spectra import lines, Gaussian, Lorentzian, Voigt, line_profile, thermal_b_param
-#from pygad.analysis.vpfit import find_regions
-from ..units import Unit, UnitArr, UnitQty, UnitScalar
-from .. import environment
-import os
-import sys
+__all__ = [
+    "Spectrum",
+    "fit_profiles",
+    "model_tau",
+    "fit_profiles_sat",
+    "find_regions",
+    "EquivalentWidth",
+    "write_spectrum",
+    "write_line_list",
+]
 
 import numpy as np
+import pylab as plt
+
+# from .. import utils
+from .. import environment
+from ..physics import c
+from ..units import Unit, UnitArr, UnitQty, UnitScalar
+from .absorption_spectra import line_profile, lines, thermal_b_param
+import numpy as np
 import os
-import sys
 import h5py
-import matplotlib.pyplot as plt
-import pygad as pg
 from physics import wave_to_vel, vel_to_wave, tau_to_flux
-from pygad.physics import c
 from utils import read_h5_into_dict
 from scipy import signal
-plt.rcParams['text.usetex'] = False
 import scipy
 from scipy.optimize import minimize
+plt.rcParams['text.usetex'] = False
     
-
 
 def find_peaks(flux_data,wavelength_data,min_height,distance):
 
@@ -1410,6 +1417,89 @@ def EquivalentWidth(fluxes, waves):
     dwave[0]       = np.abs(waves[1]  - waves[0])
     dwave[-1]      = np.abs(waves[-1] - waves[-2])
     return float(np.sum((1.0 - fluxes) * dwave))
+
+
+def write_spectrum(
+    spec_name,
+    line,
+    LOS_pos,
+    lambda_rest,
+    redshift,
+    vels,
+    fluxes,
+    taus,
+    noise,
+    col_dens,
+    phys_dens,
+    temps,
+    mets,
+    vpec,
+    overwrite=True,
+):
+    """
+    Output spectrum to hdf5 file.
+
+    Args:
+        spec_name (str):      Name of file to write spectrum out to.
+                              '.h5' will be appended to this.
+        line (str):           The ion name, e.g. 'H1215'
+        LOS_pos (list/array): (x,y,z) position of LOS,
+                              with the LOS axis holding a value of -1.
+        lambda_rest (float):  Rest wavelength of ion
+        redshift (float):     Redshift of snapshot
+        vels (list/array):    Velocities of pixels.
+        fluxes (list/array):  Normalized fluxes of pixels; this should include
+                              noise, smoothing, etc. so it's NOT =exp(-taus).
+        taus (list/array):    Optical depths of pixels
+        noise (list/array):   1-sigma noise array of pixels
+        col_dens (list/array): Column densities for each pixel
+        phys_dens (list/array): Tau-weighted physical densities for each pixel
+        temps (list/array):   Tau-weighted gas temperatures for each pixel
+        mets (list/array):    Tau-weighted metal mass fractions for each pixel
+        vpec (list/array):    LOS peculiar velocity for each pixel
+
+    Returns:
+
+    """
+    import os
+
+    import h5py
+
+    if os.path.isfile(spec_name) and not overwrite:
+        if environment.verbose >= environment.VERBOSE_TACITURN:
+            print(
+                (
+                    "WARNING: write_spectrum() failed: File %s exists, and overwrite set to False"
+                    % spec_name
+                )
+            )
+        return
+
+    waves = lambda_rest * (redshift + 1.0) * (1.0 + vels / c)
+    mets = np.log10(np.where(mets < 1.0e-10, 1.0e-10, mets))  # turn into log10(Z)
+    if len(LOS_pos) == 2:
+        LOS_pos = np.append(
+            np.array(LOS_pos), -1.0
+        )  # assumes if only 2 values are provided, they are (x,y), so we add -1 for z.
+
+    with h5py.File("%s.h5" % spec_name, "w") as hf:
+        lam0 = hf.create_dataset("lambda_rest", data=lambda_rest)
+        lam0.attrs["ion_name"] = line  # store line name as attribute of rest wavelength
+        hf.create_dataset("LOS_pos", data=np.array(LOS_pos))
+        hf.create_dataset("redshift", data=redshift)
+        hf.create_dataset("velocity", data=np.array(vels))
+        hf.create_dataset("wavelength", data=np.array(waves))
+        hf.create_dataset("flux", data=np.array(fluxes))
+        hf.create_dataset("tau", data=np.array(taus))
+        hf.create_dataset("noise", data=np.array(noise))
+        hf.create_dataset("col_density", data=np.array(col_dens))
+        hf.create_dataset("phys_density", data=np.array(phys_dens))
+        hf.create_dataset("temperature", data=np.array(temps))
+        hf.create_dataset("metallicity", data=np.array(mets))
+        hf.create_dataset("vpec", data=np.array(vpec))
+
+    return
+
 
 def write_line_list(spec_name, line_list, regions_l, regions_i):
     """

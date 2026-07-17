@@ -1818,7 +1818,7 @@ def fit_profiles(
     mode="Voigt",
     logN_bounds=[12, 19],
     b_bounds=[0, 100],
-    write_files=False,
+    write_lines=False,
     plot_fit=False,
 ):
     """

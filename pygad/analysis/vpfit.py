@@ -3,9 +3,9 @@ Routines to fit Voigt profiles to absorption line spectra.
 
 This module implements the full Voigt-profile fitting pipeline used in pygad.
 The top-level entry point is fit_profiles(), which reads a spectrum (from a
-pygad HDF5 file or from arrays supplied directly), identifies significant
+pygad spectrum file or from arrays supplied directly), identifies significant
 absorption regions, fits multi-component Voigt/Gaussian/Lorentzian profiles
-to each region, and writes the results back to the HDF5 file.
+to each region, and optionally writes the results back to the HDF5 file.
 
 Usage
 -----
@@ -23,7 +23,7 @@ Pipeline
                ├─ find_regions()
                └─ fit_profiles_sat()
 
-Last edited: Romeel Dave 14 July 2026
+Last edited: Romeel Dave, July 2026
 Contributors: Romeel Dave, Clara Lilje
 """
 
@@ -520,18 +520,19 @@ class Spectrum(object):
                                               is created when None (default).
         """
         if ax is None:
-            fig, ax = plt.subplots()
+            fig, ax = plt.subplots(figsize=(12,3))
 
         x_val = self.wavelengths
         ax.plot(x_val, self.fluxes, label='data', c='tab:grey', lw=2, ls='-')
 
         self.get_fluxes_model()
+        select = (self.wavelengths>3855)&(self.wavelengths<3860)
         for i in range(len(self.line_list['N'])):
             p = np.array([self.line_list['N'][i], self.line_list['b'][i], self.line_list['l'][i]])
             _tau_model = model_tau(self.ion_name, p, self.wavelengths)
-            ax.plot(x_val, tau_to_flux(_tau_model), alpha=0.5, lw=1, ls='--')
+            line_obj, = ax.plot(x_val, tau_to_flux(_tau_model), alpha=0.5, lw=1, ls='--')
             l_cent = self.line_list['l'][i]
-            ax.axvline(l_cent, ymin=0.95, ymax=0.98, color='r', linestyle='-', linewidth=1)
+            ax.axvline(l_cent, ymin=0.95, ymax=0.98, color=line_obj.get_color(), linestyle='-', linewidth=1)
 
         ax.plot(x_val, self.fluxes_model, label='model', c='tab:pink', ls='--', lw=2)
         ax.set_ylim(-0.1, 1.1)
@@ -708,7 +709,7 @@ def fit_profiles_sat(
         """
         Find the largest (logN, b) component that does not violate a flux floor.
 
-        Searches a 40 × 40 grid of (logN, b) values.  For each b the unit
+        Searches a 100 × 40 grid of (logN, b) values.  For each b the unit
         optical-depth profile is computed once via the lookup table and then
         linearly scaled for each logN, giving 40× fewer model evaluations than
         calling model_tau_fast for every (logN, b) pair.  The combination with
@@ -745,7 +746,7 @@ def fit_profiles_sat(
         smoothed  = np.minimum(smoothed, 1.0)
         floor     = smoothed - floor_sigma * noise
 
-        N_range = np.linspace(logN_bounds[0], logN_bounds[1], 40)
+        N_range = np.linspace(logN_bounds[0], logN_bounds[1], 100)
         b_range = np.logspace(np.log10(b_bounds[0]), np.log10(b_bounds[1]), 40)
 
         best_chisq = 1.e20
@@ -836,7 +837,7 @@ def fit_profiles_sat(
                 p_trial = np.array([Ncol, bpar, l_line])
                 model = _tau_to_flux(model_tau_fast(ion_name, p_trial, l, mode))
                 diff = model-floor
-                if np.any(diff<0):
+                if np.any(diff < 0):
                     continue
                 else:
                     p_allowed = np.append(p_allowed, p_trial)
@@ -1140,7 +1141,7 @@ def fit_profiles_sat(
                 if delta_chisq < 0.01 or chisq_trial < chisq_accept:
                     if verbose:
                         print("Region %d: Removed line %d (N=%g): chisq=%g, chisq_old=%g"
-                              %(ireg, i_del, params[3*i], chisq_trial, chisq_best))
+                              %(ireg, i_del/3, params[3*i], chisq_trial, chisq_best))
                     params     = trial_params.copy()
                     bounds     = np.delete(bounds, [i_del, i_del+1, i_del+2], axis=0)
                     chisq_best = chisq_trial
@@ -1218,7 +1219,7 @@ def fit_profiles_sat(
             i_del        = 3*i
             trial_params = np.delete(trial_params, [i_del, i_del+1, i_del+2], axis=0)
             chisq_trial  = _chisq(trial_params, l, flux, noise, ion_name, mode)
-            if chisq_trial < chisq_soln:
+            if chisq_trial < 1.001 * chisq_soln:
                 line_list  = {k: np.delete(v, i) for k, v in line_list.items()}
                 chisq_soln = chisq_trial
                 n_lines    = len(line_list["N"])
@@ -1252,7 +1253,7 @@ def fit_profiles_sat(
             trial_params[ip+2] = (N_i * params[ip+2] + N_i1 * params[ip+5]) / (N_i + N_i1)
             trial_params       = np.delete(trial_params, [ip+3, ip+4, ip+5], axis=0)
             chisq_trial  = _chisq(trial_params, l, flux, noise, ion_name, mode)
-            if chisq_trial < chisq_soln:
+            if chisq_trial < 1.001 * chisq_soln:
                 if verbose:
                     print("Full spectrum: Combined lines %d and %d (N=%g and %g): chisq=%g, chisq_old=%g"
                           %(i, i+1, N_i, N_i1, chisq_trial, chisq_soln))
@@ -1261,6 +1262,7 @@ def fit_profiles_sat(
                 line_list["l"][i] = trial_params[ip+2]
                 line_list  = {k: np.delete(v, i+1) for k, v in line_list.items()}
                 n_lines    = len(line_list["N"])
+                params = trial_params.copy()
                 chisq_soln = chisq_trial
                 break
             else:
@@ -1268,28 +1270,81 @@ def fit_profiles_sat(
         if i >= n_lines-2:
             break
 
-    chisq_trial = 0.
-    f_reduce    = 0.999
-    while chisq_trial < chisq_soln:
-        chisq_trial  = chisq_soln
-        trial_params = params.copy()
-        trial_params[::3] *= f_reduce
-        chisq_trial  = _chisq(trial_params, l, flux, noise, ion_name, mode)
-        if chisq_trial < chisq_soln:
-            if verbose:
-                print(f"Multiplying all column densities by %d improves overall fit from chisq=%g to %g"
-                      % (f_reduce, chisq_soln, chisq_trial))
-            params     = trial_params.copy()
-            chisq_soln = chisq_trial
+    # ── Final pass: optimise column densities only, b and λ fixed ────────────
+    # With line positions and widths fixed this is an n_lines-dimensional
+    # problem (vs. 3·n_lines for the full fit), so it converges very quickly.
+    # Pre-computing the unit tau profiles (N=1 per line) via the lookup table
+    # means each chi-sq evaluation costs only a dot-product + exp() — no
+    # model_tau or lookup-table interpolation needed inside the optimizer loop.
+    # This step subsumes the iterative f_reduce=0.999 column-reduction loop.
+    n_lines_final = len(line_list["N"])
 
-    params  = []
-    n_lines = len(line_list["N"])
-    for ip in range(n_lines):
-        params.append(line_list["N"][ip])
-        params.append(line_list["b"][ip])
-        params.append(line_list["l"][ip])
-    params     = np.array(params)
-    chisq_soln = _chisq(params, l, flux, noise, ion_name, mode)
+    if n_lines_final > 0:
+        b_fixed   = line_list["b"].copy()
+        l_fixed   = line_list["l"].copy()
+        logN_init = line_list["N"].copy()
+        l_arr     = np.asarray(l,     dtype=float)
+        flux_arr  = np.asarray(flux,  dtype=float)
+        noise_arr = np.asarray(noise, dtype=float)
+
+        # Pre-compute unit optical-depth profile for each line via lookup table.
+        # logN=0 → N = 10⁰ = 1 cm⁻², so compute_tau returns τ_unit directly.
+        # Shape: (n_lines_final, n_pixels).  Only needs to be done once since
+        # b and λ₀ are fixed throughout this optimisation.
+        tau_units = np.array([
+            _lookup.compute_tau(0.0, float(b_fixed[ip]), float(l_fixed[ip]), l_arr)
+            for ip in range(n_lines_final)
+        ])  # shape (n_lines_final, n_pixels)
+
+        def _chisq_N_only(logN_vals):
+            """
+            Reduced chi-squared as a function of column densities alone.
+
+            b and λ₀ are captured from the enclosing scope and held fixed.
+            Cost per call: one (n_lines × n_pixels) dot-product + one exp().
+            No model_tau or lookup-table queries inside the optimizer loop.
+
+            Args:
+                logN_vals (numpy array): log₁₀ column densities, length n_lines.
+
+            Returns:
+                chisq (float): Reduced chi-squared over the full spectrum.
+            """
+            tau_total  = np.dot(10.0 ** logN_vals, tau_units)   # (n_pixels,)
+            model_flux = np.exp(-np.clip(tau_total, -50.0, 50.0))
+            dx         = (flux_arr - model_flux) / noise_arr
+            nz         = np.count_nonzero(dx)
+            return np.sum(dx * dx) / nz if nz > 0 else 1.e20
+
+        chisq_before = _chisq_N_only(logN_init)
+
+        soln_N = minimize(
+            _chisq_N_only,
+            logN_init,
+            bounds=[logN_bounds] * n_lines_final,   # one [min, max] per line
+            #method="L-BFGS-B",                      # handles bounds, no constraints needed
+            #options={"maxiter": 200, "ftol": 1e-14, "gtol": 1e-9},
+            method="BFGS",                      # handles bounds, no constraints needed
+            options={"maxiter": 200},
+        )
+
+        if soln_N.fun < chisq_before:
+            line_list["N"] = soln_N.x
+            if verbose:
+                delta = chisq_before - soln_N.fun
+                print(
+                    f"Final N-only minimization: chisq {chisq_before:.4f} → "
+                    f"{soln_N.fun:.4f}  (Δ = {delta:.4f})  "
+                    f"after {soln_N.nit} iterations"
+                )
+                #print(f"  Optimised logN: {soln_N.x}")
+        else:
+            if verbose:
+                print(
+                    f"Final N-only minimization did not improve chisq "
+                    f"({chisq_before:.4f} → {soln_N.fun:.4f}); "
+                    f"keeping original N values."
+                )
 
     if verbose:
         print(f"Full spectrum: FINAL FIT {n_lines} lines in %d regions, chisq=%.3f. Line list [i,N,b,l]:"
@@ -1919,4 +1974,6 @@ def fit_profiles(
         write_line_list(spectrum_file, spec.line_list, spec.regions_l, spec.regions_i)
     if plot_fit:
         spec.plot_fit()
+
+    return spec.line_list
 

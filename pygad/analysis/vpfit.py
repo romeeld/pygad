@@ -1324,14 +1324,15 @@ def fit_profiles_sat(
             bounds=[logN_bounds] * n_lines_final,   # one [min, max] per line
             #method="L-BFGS-B",                      # handles bounds, no constraints needed
             #options={"maxiter": 200, "ftol": 1e-14, "gtol": 1e-9},
-            method="BFGS",                      # handles bounds, no constraints needed
-            options={"maxiter": 200},
+            method="Powell",                      # handles bounds, no constraints needed
+            options={"maxiter": 200}, 
         )
 
         if soln_N.fun < chisq_before:
             line_list["N"] = soln_N.x
+            chisq_soln = soln_N.fun
             if verbose:
-                delta = chisq_before - soln_N.fun
+                delta = chisq_before - chisq_soln
                 print(
                     f"Final N-only minimization: chisq {chisq_before:.4f} → "
                     f"{soln_N.fun:.4f}  (Δ = {delta:.4f})  "

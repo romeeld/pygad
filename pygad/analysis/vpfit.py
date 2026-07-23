@@ -138,8 +138,7 @@ class Spectrum(object):
             line = lines[ion_name]
             lambda_rest = UnitScalar(line["l"], 'Angstrom')
         else:
-            print('Could not find line %s in database.' % ion_name)
-            exit
+            raise ValueError('Could not find line %s in database.' % ion_name)
         # compute wavelengths or velocities from the other
         if vel is not None:
             wave = lambda_rest * (redshift + 1.0) * (1.0 + vel / float(c.in_units_of('km/s')))
@@ -147,8 +146,7 @@ class Spectrum(object):
             vel = l / (lambda_rest * (redshift + 1.0)) * float(c.in_units_of('km/s')) - 1.0
             wave = l
         else:
-            print('One of l or vel must be provided.')
-            exit
+            raise ValueError('One of l or vel must be provided.')
         # load spectrum
         self.ion_name = ion_name
         self.lambda_rest = lambda_rest
@@ -157,7 +155,7 @@ class Spectrum(object):
         self.noise = noise
         self.redshift = redshift
         self.velocities = vel
-        self.continuum = np.ones(len(l))
+        self.continuum = np.ones(len(self.wavelengths))
         self.verbose = (environment.verbose >= environment.VERBOSE_QUIET)
         if self.verbose:
             print('N,b bounds:', self.logN_bounds, self.b_bounds)
@@ -244,9 +242,9 @@ class Spectrum(object):
 
         return i_start, i_end, N
 
-    def buffer_with_continuum(self, waves, flux, nbuffer=50, snr_default=30.):
+    def buffer_with_continuum(self, waves, flux, noise, nbuffer=50):
         """
-        Pad a wavelength/flux pair with continuum-level pixels at each end.
+        Pad wavelength/flux/noise with continuum-level pixels at each end.
 
         Extends the wavelength axis by extrapolating with the pixel spacing at
         each edge and sets the padded flux values to 1 (continuum).  The buffer
@@ -256,9 +254,6 @@ class Spectrum(object):
             waves (numpy array):   Wavelength array (Å).
             flux (numpy array):    Normalised flux array.
             nbuffer (int):         Number of continuum pixels to add at each end.
-            snr_default (float):   Signal-to-noise ratio used when self.snr is not
-                                   set.  Currently reserved for future noise-padded
-                                   buffer implementations.
 
         Returns:
             waves (numpy array):  Extended wavelength array of length
@@ -267,23 +262,25 @@ class Spectrum(object):
                                   len(flux) + 2*nbuffer, with flux = 1 at
                                   both padded ends.
         """
-        if hasattr(self, 'snr'):
-            snr = self.snr
-        else:
-            snr = snr_default
         dl = waves[1] - waves[0]
         l_start = np.arange(waves[0] - dl*nbuffer, waves[0], dl)
         l_end = np.arange(waves[-1]+dl, waves[-1] + dl*(nbuffer+1), dl)
 
         waves = np.concatenate((l_start, waves, l_end))
-        new_noise = np.zeros(2*nbuffer)
         flux = np.concatenate((
-            tau_to_flux(np.zeros(nbuffer)) + new_noise[:nbuffer],
+            np.ones(nbuffer),
             flux,
-            tau_to_flux(np.zeros(nbuffer)) + new_noise[nbuffer:]
+            np.ones(nbuffer)
+        ))
+        mean_noise = np.sum(noise)/len(noise)
+        new_noise = mean_noise * np.ones(2*nbuffer)
+        noise = np.concatenate((
+            new_noise[:nbuffer],
+            noise,
+            new_noise[nbuffer:]
         ))
 
-        return waves, flux
+        return waves, flux, noise
 
     def periodic_wrap(self):
         """
@@ -333,7 +330,7 @@ class Spectrum(object):
         l = np.where(l > l_box, l - l_box, l)
         return l
 
-    def prepare_spectrum(self, vel_range, do_continuum_buffer=False, nbuffer=10, snr_default=30):
+    def prepare_spectrum(self, vel_range, do_continuum_buffer=True, nbuffer=50):
         """
         Extract and prepare the portion of the spectrum to be fitted.
 
@@ -357,18 +354,15 @@ class Spectrum(object):
                                          before fitting.
             nbuffer (int):               Number of buffer pixels per end when
                                          do_continuum_buffer is True.
-            snr_default (float):         Signal-to-noise ratio used to construct
-                                         noise_fit when self.snr is not set.
         """
         if self.gal_velocity_pos is not None:
             i_start, i_end, N = self.get_initial_window(vel_range)
             i_start, i_end, N = self.extend_to_continuum(i_start, i_end, N)
+            self.wrap_pixel = 0
             if i_start < 0:
                 i_start += len(self.wavelengths)
                 i_end += len(self.wavelengths)
         else:
-            self.orig_fluxes = self.fluxes
-            self.orig_noise = self.noise
             self.fluxes, self.noise, self.wrap_pixel = self.periodic_wrap()
             i_start = 0
             i_end = len(self.wavelengths)
@@ -376,6 +370,7 @@ class Spectrum(object):
 
         self.waves_fit  = self.wavelengths.take(range(i_start, i_end), mode='wrap')
         self.fluxes_fit = self.fluxes.take(range(i_start, i_end), mode='wrap')
+        self.noise_fit = self.noise.take(range(i_start, i_end), mode='wrap')
 
         i_wrap = len(self.wavelengths) - i_start
         wave_boxsize = self.wavelengths[-1] - self.wavelengths[0]
@@ -384,15 +379,10 @@ class Spectrum(object):
             self.waves_fit[i_wrap:] += wave_boxsize + dl
 
         if do_continuum_buffer is True:
-            self.waves_fit, self.fluxes_fit = self.buffer_with_continuum(
-                self.waves_fit, self.fluxes_fit, nbuffer=nbuffer
+            self.waves_fit, self.fluxes_fit, self.noise_fit = self.buffer_with_continuum(
+                self.waves_fit, self.fluxes_fit, self.noise_fit, nbuffer=nbuffer
             )
 
-        if hasattr(self, 'snr'):
-            snr = self.snr
-        else:
-            snr = snr_default
-        self.noise_fit = np.asarray([1./snr] * len(self.fluxes_fit))
 
     def fit_periodic_spectrum(self):
         """
@@ -457,7 +447,7 @@ class Spectrum(object):
         self.fluxes_model = tau_to_flux(self.tau_model)
 
     def fit_profiles(self, vel_range, do_continuum_buffer=True, nbuffer=50,
-                     snr_default=30., chisq_lim=2.0, chisq_unacceptable=25,
+                     chisq_lim=2.0, 
                      chisq_factor=0.95, N_sigma_constr=3.0, max_lines=12):
         """
         Prepare the spectrum and fit Voigt profiles to all absorption regions.
@@ -478,18 +468,15 @@ class Spectrum(object):
             vel_range (float):           Half-width of the velocity window (km/s).
             do_continuum_buffer (bool):  Pad each end with nbuffer continuum pixels.
             nbuffer (int):               Number of continuum buffer pixels per end.
-            snr_default (float):         Fallback SNR used to build the noise array.
             chisq_lim (float):           Reduced χ² acceptance threshold; no more
                                          lines are added once χ² falls below this.
-            chisq_unacceptable (float):  Reduced χ² above which the fit for a region
-                                         is flagged as unreliable.
             chisq_factor (float):        A new line is accepted only when it reduces
                                          χ² by at least this factor (must be ≤ 1).
             N_sigma_constr (float):      The model flux is constrained to exceed
                                          flux − N_sigma_constr × noise at every pixel.
             max_lines (int):             Maximum Voigt components allowed per region.
         """
-        self.prepare_spectrum(vel_range, do_continuum_buffer=True, nbuffer=50, snr_default=30.)
+        self.prepare_spectrum(vel_range, do_continuum_buffer=True, nbuffer=50)
         self.regions_l, self.regions_i = find_regions(
             self.waves_fit, self.fluxes_fit, self.noise_fit, verbose=self.verbose
         )
@@ -497,7 +484,7 @@ class Spectrum(object):
             self.ion_name, self.waves_fit, self.fluxes_fit, self.noise_fit,
             self.regions_l, self.regions_i,
             chisq_lim=chisq_lim, chisq_factor=chisq_factor,
-            chisq_unacceptable=chisq_unacceptable, N_sigma_constr=N_sigma_constr,
+            N_sigma_constr=N_sigma_constr,
             max_lines=max_lines,
             logN_bounds=self.logN_bounds,
             b_bounds=self.b_bounds, mode='Voigt', verbose=self.verbose
@@ -526,7 +513,6 @@ class Spectrum(object):
         ax.plot(x_val, self.fluxes, label='data', c='tab:grey', lw=2, ls='-')
 
         self.get_fluxes_model()
-        select = (self.wavelengths>3855)&(self.wavelengths<3860)
         for i in range(len(self.line_list['N'])):
             p = np.array([self.line_list['N'][i], self.line_list['b'][i], self.line_list['l'][i]])
             _tau_model = model_tau(self.ion_name, p, self.wavelengths)
@@ -551,7 +537,6 @@ def fit_profiles_sat(
     regions_i,
     chisq_lim=2,
     chisq_factor=0.95,
-    chisq_unacceptable=50.,
     N_sigma_constr=3.0,
     max_lines=12,
     mode="Voigt",
@@ -584,9 +569,6 @@ def fit_profiles_sat(
                                     No more lines are added once χ² < chisq_lim.
         chisq_factor (float):       A newly added line is accepted only when it
                                     reduces χ² by at least this factor (≤ 1).
-        chisq_unacceptable (float): Reduced χ² above which the fit is considered
-                                    to have failed; triggers a reset in saturated
-                                    region handling.
         N_sigma_constr (float):     The constrained minimiser requires the model
                                     flux to exceed flux − N_sigma_constr × noise
                                     at every pixel.
@@ -616,9 +598,8 @@ def fit_profiles_sat(
 
     np.set_printoptions(formatter={'float': '{:.4f}'.format})
 
-    if isinstance(ion_name, str):
-        line = lines[ion_name]
-    l0 = line["l"]
+    line = lines[ion_name]
+    l0 = float(line["l"].split()[0])
     if isinstance(l, np.ndarray) or l.units in [1, None]:
         l = UnitArr(l, "Angstrom")
 
@@ -677,7 +658,7 @@ def fit_profiles_sat(
         if len(p) == 0:
             resid = flux
         else:
-            resid = 1.0 + flux - _tau_to_flux(model_tau(ion_name, p, l, mode))
+            resid = 1.0 + flux - _tau_to_flux(model_tau_fast(ion_name, p, l, mode))
         l_bounds = [l[1], l[-2]]
 
         if grow_line:
@@ -780,78 +761,6 @@ def fit_profiles_sat(
 
         return best_N, best_b, l_line
 
-    def _grow_line_old(ion_name, l, flux, noise, resid, l0, mode,
-                       i_line=None, floor_sigma=1.5, smooth_sigma=1., unsat_sigma=3.):
-        """
-        Legacy implementation of _grow_line (retained for reference).
-
-        This version calls model_tau_fast for every (logN, b) pair in the
-        search grid (up to 1 600 calls per invocation) and accumulates all
-        allowed parameter sets before selecting the best χ².  It has been
-        superseded by _grow_line(), which pre-computes the unit profile once
-        per b value and achieves equivalent results with 40× fewer model calls.
-
-        Args:  (same as _grow_line)
-        Returns:  (same as _grow_line)
-        """
-        if smooth_sigma > 0.:
-            smoothed = scipy.ndimage.gaussian_filter1d(resid, smooth_sigma)
-        else:
-            smoothed = resid
-        if i_line is None:
-            i_line = np.argmin(smoothed)
-
-        l_line = l[i_line]
-        if resid[i_line] < np.min(abs(noise)):
-            i_lo = i_line
-            while resid[i_lo] < unsat_sigma * noise[i_lo] and i_lo > 0: i_lo -= 1
-            i_hi = i_line
-            while resid[i_hi] < unsat_sigma * noise[i_hi] and i_hi < len(l)-1: i_hi += 1
-            i_line = int(0.5 * (i_lo+i_hi))
-            l_line = l[i_line]
-            N_lim  = logN_bounds[1]
-            b_lim = 2.*min(abs(l_line-l[i_lo]),abs(l[i_hi]-l_line)) * float(c.in_units_of('km/s')) / float(l0)
-        else:
-            N_lim = 15.0
-            fdec_bottom = 1.-resid[i_line]
-            i_lo = i_line
-            while 1.-resid[i_lo] < 0.5 * fdec_bottom and i_lo > 0: i_lo -= 1
-            i_hi = i_line
-            while 1.-resid[i_hi] < 0.5 * fdec_bottom and i_hi < len(l)-1: i_hi += 1
-            b_lim = 4.*min(abs(l_line-l[i_lo]),abs(l[i_hi]-l_line)) * float(c.in_units_of('km/s')) / float(l0)
-        b_lim = min(max(b_lim, max(b_bounds[0],20)), b_bounds[1])
-
-        smoothed = np.where(smoothed > 1., 1., smoothed)
-        floor = smoothed - floor_sigma * noise
-
-        N_range = np.linspace(start=logN_bounds[0], stop=N_lim, num=40)
-        b_range = np.linspace(start=np.log10(b_bounds[0]), stop=np.log10(b_lim), num=40)
-        b_range = 10**b_range
-        N_min = logN_bounds[0]
-        p_allowed = np.array([logN_bounds[0], b_bounds[0], l_line])
-        chisq = [1.e20]
-        for bpar in b_range:
-            for Ncol in N_range:
-                if Ncol < N_min:
-                    continue
-                p_trial = np.array([Ncol, bpar, l_line])
-                model = _tau_to_flux(model_tau_fast(ion_name, p_trial, l, mode))
-                diff = model-floor
-                if np.any(diff < 0):
-                    continue
-                else:
-                    p_allowed = np.append(p_allowed, p_trial)
-                    i_lo = np.argmin(model)
-                    while (1.-model[i_lo]) > 0.5 * (1.-model[i_line]) and i_lo > 0: i_lo -= 1
-                    i_hi = np.argmin(model)
-                    while (1.-model[i_hi]) > 0.5 * (1.-model[i_line]) and i_hi < len(model)-2: i_hi += 1
-                    dx_array = (resid[i_lo:i_hi+1] - model[i_lo:i_hi+1]) / noise[i_lo:i_hi+1]
-                    i_min = np.argmin(diff)
-                    chi2 = np.sum(dx_array * dx_array) / np.count_nonzero(dx_array)
-                    chisq.append(chi2)
-        i_p = np.argmin(np.array(chisq))
-        return p_allowed[3*i_p], p_allowed[3*i_p+1], l_line
-
     def _maxiter(n, nmax):
         """
         Return the maximum minimiser iterations for a fit with n components.
@@ -925,8 +834,6 @@ def fit_profiles_sat(
         "Chisq": np.array([])
     }
 
-    sat_regions = False
-
     for ireg in range(len(regions_l)):
 
         params = []
@@ -948,7 +855,6 @@ def fit_profiles_sat(
         bounds_reg = []
         best_nlines = 0
         if len(bounding_i) != 0:
-            sat_regions = True
             if verbose:
                 print('Region %d has %d saturated area(s) at pixels:'%(ireg, len(regions_i_sat)), regions_i_sat)
             for ireg_sat in range(len(regions_l_sat)):
@@ -1014,7 +920,6 @@ def fit_profiles_sat(
             if chisq_soln > 10000:
                 params = []
                 bounds = []
-                sat_regions = False
                 print('ChiSquare is too big, probably no saturated region.')
 
         else:
@@ -1030,7 +935,7 @@ def fit_profiles_sat(
             n_reg = noise[regions_i[ireg, 0] : regions_i[ireg, 1]]
 
         if len(params) != 0:
-            resid = (1.0 + f_reg - _tau_to_flux(model_tau(ion_name, params.flatten(), l_reg, mode)))
+            resid = (1.0 + f_reg - _tau_to_flux(model_tau_fast(ion_name, params.flatten(), l_reg, mode)))
         else:
             distance = int(len(l_reg)/20)
             if distance < 1:
@@ -1041,11 +946,11 @@ def fit_profiles_sat(
         chisq_old  = 1.e20
         delta_l    = l_reg[1]-l_reg[0]
         while n_lines < max_lines-1:
-            params, bounds = _add_line(ion_name, params, bounds, l_reg, f_reg, n_reg, float(l0.split()[0]), mode)
+            params, bounds = _add_line(ion_name, params, bounds, l_reg, f_reg, n_reg, l0, mode)
             if params[-1] in params[2::3]:
                 params[-1] = params[-1] + delta_l * (0.5*np.random.rand() - 1)
             n_lines    = int(len(params) / 3)
-            resid      = 1.0 + f_reg - _tau_to_flux(model_tau(ion_name, params.flatten(), l_reg, mode))
+            resid      = 1.0 + f_reg - _tau_to_flux(model_tau_fast(ion_name, params.flatten(), l_reg, mode))
             chisq_soln = _chisq(params, l_reg, f_reg, n_reg, ion_name, mode)
             if chisq_soln < chisq_best:
                 best_nlines  = n_lines
@@ -1075,9 +980,8 @@ def fit_profiles_sat(
         first_time  = True
         while n_lines < max_lines and chisq_soln > chisq_accept:
             if not first_time:
-                params, bounds = _add_line(ion_name, params, bounds, l_reg, f_reg, n_reg, float(l0.split()[0]), mode)
+                params, bounds = _add_line(ion_name, params, bounds, l_reg, f_reg, n_reg, l0, mode)
                 n_lines = int(len(params) / 3)
-            chisq_fcn  = lambda *args: _chisq(*args)
             constraint = NonlinearConstraint(
                 fun=_model_flux,
                 lb=f_reg - N_sigma_constr * n_reg,
@@ -1085,7 +989,7 @@ def fit_profiles_sat(
                 jac=_constraint_jac,
             )
             soln = minimize(
-                chisq_fcn,
+                _chisq,
                 params,
                 bounds=bounds,
                 args=(l_reg, f_reg, n_reg, ion_name, mode),
@@ -1121,9 +1025,8 @@ def fit_profiles_sat(
         delta_params   = [0.02, 0.05, 0.0001] * n_lines
         if compute_errors:
             params_jiggled = params + delta_params * (2 * np.random.rand(len(params)) - 1)
-            chisq_fcn      = lambda *args: _chisq(*args)
             soln = minimize(
-                chisq_fcn,
+                _chisq,
                 params_jiggled,
                 args=(l_reg, f_reg, n_reg, ion_name, mode),
                 method="BFGS",
@@ -1188,7 +1091,7 @@ def fit_profiles_sat(
             line_list["dN"]     = np.append(line_list["dN"], np.sqrt(cov[ip * 3, ip * 3]))
             line_list["db"]     = np.append(line_list["db"], np.sqrt(cov[ip * 3 + 1, ip * 3 + 1]))
             line_list["dl"]     = np.append(line_list["dl"], np.sqrt(cov[ip * 3 + 2, ip * 3 + 2]))
-            tau_line = model_tau(
+            tau_line = model_tau_fast(
                 ion_name,
                 [params[ip * 3], params[ip * 3 + 1], params[ip * 3 + 2]],
                 l_reg, mode,
@@ -1867,7 +1770,6 @@ def fit_profiles(
     gal_v_pos=None,
     vel_range=0,
     chisq_lim=2.0,
-    chisq_unacceptable=50.0,
     chisq_factor=0.95,
     max_lines=15,
     N_sigma_constr=3.0,
@@ -1908,8 +1810,6 @@ def fit_profiles(
                                   fit the entire spectrum.
         chisq_lim (float):        Reduced χ² acceptance threshold; fitting stops
                                   adding lines once χ² < chisq_lim.
-        chisq_unacceptable (float): Reduced χ² above which the regional fit is
-                                  considered to have failed.
         chisq_factor (float):     A new line is accepted only when it reduces χ²
                                   by at least this factor (must be ≤ 1).
         max_lines (int):          Maximum Voigt components per absorption region.
@@ -1945,21 +1845,27 @@ def fit_profiles(
         l        = np.array(f['wavelength'])
         flux     = np.array(f['flux'])
         noise    = np.array(f['noise'])
+        #noise = np.where(noise < 0.03333, 0.03333, noise)
         vel      = np.array(f['velocity'])
         redshift = np.array(f['redshift'])
         f.close()
     elif line is not None and l is not None:
-        print('Fitting profiles for %s spectrum with %d pixels' % (line, len(l)))
+        if isinstance(line, str):
+            line_struct = lines[line]
+            lambda_rest = UnitScalar(line_struct["l"], 'Angstrom')
+            redshift = l[0] / lambda_rest - 1
+        else:
+            raise ValueError('Could not find line %s in database.' % line)
+        print('Fitting profiles for %s spectrum at z=%g with %d pixels' % (line, redshift, len(l)))
     else:
-        print('Must provide either spectrum_file or [wave, flux, noise, vel]')
-        exit
+        raise ValueError('Must provide either spectrum_file or [wave, flux, noise, vel]')
+
+    gal_velocity_pos = None
 
     if b_bounds[0] == 0.:
         T       = UnitScalar(1.e4, "K")
         b_therm = thermal_b_param(line, T, "km/s")
         b_bounds = [0.25*float(b_therm), b_bounds[1]]
-
-    gal_velocity_pos = None
 
     spec = Spectrum(
         line, redshift, l, flux, noise, vel,
@@ -1968,7 +1874,7 @@ def fit_profiles(
     )
     spec.fit_profiles(
         vel_range=vel_range, chisq_lim=chisq_lim,
-        chisq_unacceptable=chisq_unacceptable, chisq_factor=chisq_factor,
+        chisq_factor=chisq_factor,
         max_lines=max_lines, N_sigma_constr=N_sigma_constr
     )
     if write_lines:

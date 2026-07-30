@@ -22,7 +22,7 @@ COPY . /data/pygad
 #     chown -R runner /data
 
 # USER runner
-ENV PATH="/home/runner/.local/bin:${PATH}"
+ENV PATH="/home/rad/.local/bin:${PATH}"
 
 WORKDIR "/data/pygad"
 

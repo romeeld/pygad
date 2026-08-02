@@ -50,3 +50,6 @@ pygad/_version.py
 
 # ignore this file to avoid useless build errors (romeel)
 .github/traffic/traffic.json
+
+# ignore this file because it was the older version of upgraded vpfit Romeel sent to Joanne in 2025 (and was not integrated to pygad yet)
+pygad/analysis/fit_profiles.py

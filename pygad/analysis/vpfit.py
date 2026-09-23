@@ -47,8 +47,8 @@ from ..units import Unit, UnitArr, UnitQty, UnitScalar
 from .absorption_spectra import line_profile, lines, thermal_b_param
 import os
 import h5py
-from physics import wave_to_vel, vel_to_wave, tau_to_flux
-from utils import read_h5_into_dict
+from .physics import wave_to_vel, vel_to_wave, tau_to_flux
+from .utils import read_h5_into_dict
 from scipy import signal
 import scipy
 from scipy.optimize import minimize, NonlinearConstraint

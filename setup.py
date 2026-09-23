@@ -26,15 +26,17 @@ for root, dirs, files in os.walk(setup_dir):
 subprocess.run(["make", "clean"], cwd=setup_dir + "/pygad/C", check=False)
 
 include_dirs = [
-    "/usr/include/",
     "pygad/C/include/",
     "/opt/homebrew/opt/gsl/include/",
     "/opt/local/",
 ]
 library_dirs = []
-if os.getenv("GSL_HOME") is not None:
-    include_dirs.append(os.getenv("GSL_HOME") + "/include")
-    library_dirs.append(os.getenv("GSL_HOME") + "/lib")
+# GSL_HOME is our own convention; EBROOTGSL is set by Lmod/EasyBuild module
+# systems (e.g. Compute Canada clusters) when a "gsl" module is loaded.
+gsl_home = os.getenv("GSL_HOME") or os.getenv("EBROOTGSL")
+if gsl_home is not None:
+    include_dirs.append(gsl_home + "/include")
+    library_dirs.append(gsl_home + "/lib")
 
 if sys.platform == "darwin":
     # Apple clang does not support GCC's -fopenmp / -lgomp; use libomp instead
@@ -62,6 +64,11 @@ else:
     omp_link_args = ["-fopenmp"]
     omp_libraries = ["m", "gsl", "gslcblas", "gomp"]
 
+# Embed the library search paths in the extension itself, so it can find
+# libgsl/libgomp at runtime without needing LD_LIBRARY_PATH set (e.g. GSL
+# loaded via an Lmod module at build time but not at import time).
+rpath_args = [f"-Wl,-rpath,{lib_dir}" for lib_dir in library_dirs]
+
 ext_module = Extension(
     "pygad.C.cpygad",
     language="c++",
@@ -77,7 +84,7 @@ ext_module = Extension(
         "-Wextra",
     ],
     libraries=omp_libraries,
-    extra_link_args=omp_link_args,
+    extra_link_args=omp_link_args + rpath_args,
     library_dirs=library_dirs,
 )
 

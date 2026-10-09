@@ -607,5 +607,124 @@
     "unique_cloners": 19,
     "views": 0,
     "unique_viewers": 0
+  },
+  "2026-09-22": {
+    "date": "2026-09-22",
+    "clones": 11,
+    "unique_cloners": 6,
+    "views": 0,
+    "unique_viewers": 0
+  },
+  "2026-09-23": {
+    "date": "2026-09-23",
+    "clones": 11,
+    "unique_cloners": 5,
+    "views": 0,
+    "unique_viewers": 0
+  },
+  "2026-09-24": {
+    "date": "2026-09-24",
+    "clones": 12,
+    "unique_cloners": 7,
+    "views": 1,
+    "unique_viewers": 1
+  },
+  "2026-09-25": {
+    "date": "2026-09-25",
+    "clones": 10,
+    "unique_cloners": 7,
+    "views": 0,
+    "unique_viewers": 0
+  },
+  "2026-09-26": {
+    "date": "2026-09-26",
+    "clones": 15,
+    "unique_cloners": 8,
+    "views": 0,
+    "unique_viewers": 0
+  },
+  "2026-09-27": {
+    "date": "2026-09-27",
+    "clones": 13,
+    "unique_cloners": 6,
+    "views": 0,
+    "unique_viewers": 0
+  },
+  "2026-09-28": {
+    "date": "2026-09-28",
+    "clones": 5,
+    "unique_cloners": 3,
+    "views": 0,
+    "unique_viewers": 0
+  },
+  "2026-09-29": {
+    "date": "2026-09-29",
+    "clones": 8,
+    "unique_cloners": 5,
+    "views": 1,
+    "unique_viewers": 1
+  },
+  "2026-09-30": {
+    "date": "2026-09-30",
+    "clones": 11,
+    "unique_cloners": 5,
+    "views": 1,
+    "unique_viewers": 1
+  },
+  "2026-10-01": {
+    "date": "2026-10-01",
+    "clones": 22,
+    "unique_cloners": 13,
+    "views": 0,
+    "unique_viewers": 0
+  },
+  "2026-10-02": {
+    "date": "2026-10-02",
+    "clones": 60,
+    "unique_cloners": 21,
+    "views": 2,
+    "unique_viewers": 2
+  },
+  "2026-10-03": {
+    "date": "2026-10-03",
+    "clones": 21,
+    "unique_cloners": 12,
+    "views": 18,
+    "unique_viewers": 1
+  },
+  "2026-10-04": {
+    "date": "2026-10-04",
+    "clones": 16,
+    "unique_cloners": 8,
+    "views": 2,
+    "unique_viewers": 2
+  },
+  "2026-10-05": {
+    "date": "2026-10-05",
+    "clones": 29,
+    "unique_cloners": 16,
+    "views": 0,
+    "unique_viewers": 0
+  },
+  "2026-10-06": {
+    "date": "2026-10-06",
+    "clones": 14,
+    "unique_cloners": 7,
+    "views": 0,
+    "unique_viewers": 0
+  },
+  "2026-10-07": {
+    "date": "2026-10-07",
+    "clones": 30,
+    "unique_cloners": 18,
+    "views": 0,
+    "unique_viewers": 0
+  },
+  "2026-10-08": {
+    "date": "2026-10-08",
+    "clones": 33,
+    "unique_cloners": 17,
+    "views": 0,
+    "unique_viewers": 0
   }
 }

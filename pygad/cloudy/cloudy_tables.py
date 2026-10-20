@@ -229,12 +229,13 @@ class IonisationTable(object):
             fG_limit = 1e-3
             fG[ fG < fG_limit ] = fG_limit
             # decreasing the radiation by a factor of fG corresponds to increasing
-            # the density by the same factor fG:
-            nH /= fG
+            # the density by the same factor fG (not in place: nH may be the
+            # snapshot's cached 'nH' block):
+            nH = nH / fG
 
         # assume the optical thin limit (as done for the self-shielding, too)
         if self._flux_factor != 1.0:
-            nH /= self._flux_factor
+            nH = nH / self._flux_factor
 
         # look-up tables use log10-values
         nH = np.log10( nH )

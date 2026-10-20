@@ -1,4 +1,4 @@
-"""Regression checks for the three pygad bug fixes.
+"""Regression checks for pygad bug fixes.
 
 Run with the project venv:
 
@@ -57,6 +57,23 @@ def check_fix3c():
     assert r2.units is None
 
 
+def check_fix4():
+    # FIX 4: IonisationTable.interp_parts with self-shielding (or a flux
+    # factor) no longer divides the passed-in nH array in place, which
+    # corrupted a snapshot's cached 'nH' block on every ion lookup.
+    import numpy as np
+
+    from pygad.cloudy import config_ion_table
+    tbl = config_ion_table(2.0)
+    nH = UnitArr(np.logspace(-6, 0, 7), 'cm**-3')
+    T = UnitArr(np.full(7, 1e4), 'K')
+    nH0 = np.array(nH).copy()
+    f1 = tbl.interp_parts('C IV', nH, T, selfshield=True, z=2.0, fbaryon=0.16)
+    assert np.array_equal(np.array(nH), nH0), "nH modified in place"
+    f2 = tbl.interp_parts('C IV', nH, T, selfshield=True, z=2.0, fbaryon=0.16)
+    assert np.array_equal(f1, f2), "repeated lookups differ"
+
+
 def check_sanity():
     # Sanity: a unitful multiplication still yields a UnitArr with units.
     r = UnitArr([2., 4.], 'm') * UnitArr([2., 4.], 's')
@@ -70,5 +87,6 @@ if __name__ == '__main__':
     check_fix3a()
     check_fix3b()
     check_fix3c()
+    check_fix4()
     check_sanity()
     print("all regression checks passed")

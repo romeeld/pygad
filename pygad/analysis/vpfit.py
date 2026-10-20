@@ -53,9 +53,9 @@ Doctests:
     >>> import os, shutil, tempfile
     >>> tmpdir = tempfile.mkdtemp()
     >>> spec_name = os.path.join(tmpdir, 'spec')
-    >>> def write(vels, overwrite=True):
+    >>> def write(vels, overwrite=True, name=spec_name):
     ...     n = len(vels)
-    ...     write_spectrum(spec_name, 'H1215', [1., 2.], l_rest, 2.0, vels, np.ones(n),
+    ...     write_spectrum(name, 'H1215', [1., 2.], l_rest, 2.0, vels, np.ones(n),
     ...                    np.zeros(n), np.full(n, 0.01), np.zeros(n), np.zeros(n),
     ...                    np.zeros(n), np.zeros(n), np.zeros(n), overwrite=overwrite)
     ...     with h5py.File(spec_name + '.h5', 'r') as hf:
@@ -66,11 +66,24 @@ Doctests:
     [3647.01  3659.175]
     >>> print(np.round(write(np.array([0., 2000.]), overwrite=False), 3))
     [3647.01  3659.175]
+
+    '.h5' is only appended when missing, and write_line_list accepts either
+    form of the name:
+    >>> print(np.round(write(np.array([0., 1000.]), name=spec_name + '.h5'), 3))
+    [3647.01  3659.175]
+    >>> sorted(os.listdir(tmpdir))
+    ['spec.h5']
+    >>> ll = {'region': [0], 'N': [13.], 'dN': [0.1], 'b': [20.], 'db': [1.],
+    ...       'l': [3. * l_rest], 'dl': [0.01], 'EW': [0.1], 'Chisq': [1.]}
+    >>> write_line_list(spec_name, ll, [[3646., 3648.]], [[0, 1]], mode='Gaussian')
+    >>> with h5py.File(spec_name + '.h5', 'r') as hf:
+    ...     print(hf['line_list'].attrs['mode'], len(hf['line_list/logN']))
+    Gaussian 1
     >>> shutil.rmtree(tmpdir)
 
     Fitting a full-box (periodic) spectrum returns line centres on the input
     grid, also for a line crossing the box edge (at v=995 km/s, with the box
-    spanning 0-1000 km/s), and the model reproduces the input:
+    spanning 0-1000 km/s), and the (periodic) model fits the input:
     >>> vel = (np.arange(400) + 0.5) * 2.5
     >>> l = 3. * l_rest * (1. + vel / c_kms)
     >>> true = [(13.5, 25., 150.), (13., 20., 995.)]
@@ -93,7 +106,20 @@ Doctests:
     >>> spec.wrap_pixel > 0, bool(np.array_equal(spec.fluxes, flux))
     (True, True)
     >>> spec.get_fluxes_model()
-    >>> bool(np.max(np.abs(spec.fluxes_model - flux)) < 0.01)
+    >>> bool(np.mean(((spec.fluxes_model - flux) / noise)**2) < 2.)    # periodic model
+    True
+
+    The profile shape (`mode`) is used for fitting and for the model:
+    >>> from pygad.analysis.tau_lookup import _tau_lookup_cache
+    >>> _ = fit_profiles('H1215', l=l, vel=vel, flux=flux, noise=noise,
+    ...                  logN_bounds=[12, 15], b_bounds=[5, 100], mode='Gaussian')
+    Fitting profiles for H1215 spectrum at z=2 with 400 pixels
+    >>> ('H1215', 'Gaussian') in _tau_lookup_cache
+    True
+    >>> voigt_model = spec.fluxes_model
+    >>> spec.mode = 'Lorentzian'
+    >>> spec.get_fluxes_model()
+    >>> bool(np.max(np.abs(spec.fluxes_model - voigt_model)) > 0.1)
     True
     >>> environment.verbose = environment.VERBOSE_NORMAL
 """
@@ -200,10 +226,16 @@ class Spectrum(object):
                                     snr (float):           Signal-to-noise ratio.
                                     gal_velocity_pos (float): Galaxy LOS velocity
                                                            (km/s).
+                                    mode (str):            Profile shape used for
+                                                           fitting and models:
+                                                           'Voigt' (default),
+                                                           'Gaussian' or
+                                                           'Lorentzian'.
         """
         # assign optional keyword arguments
         for key in kwargs:
             setattr(self, key, kwargs[key])
+        self.mode = getattr(self, 'mode', 'Voigt')
         # look up line to fit
         if isinstance(ion_name, str):
             line = lines[ion_name]
@@ -511,7 +543,9 @@ class Spectrum(object):
         Compute the total model optical depth from all fitted absorption lines.
 
         Sums contributions from every line in self.line_list over the full
-        wavelength array self.wavelengths using model_tau().
+        wavelength array self.wavelengths using model_tau().  Without
+        gal_velocity_pos the spectrum is a periodic full box, so lines near
+        one edge also absorb at the other.
 
         Sets:
             self.tau_model (numpy array): Optical depth at each wavelength pixel.
@@ -519,7 +553,13 @@ class Spectrum(object):
         self.tau_model = np.zeros(len(self.wavelengths))
         for i in range(len(self.line_list["N"])):
             p = np.array([self.line_list["N"][i], self.line_list["b"][i], self.line_list["l"][i]])
-            self.tau_model += model_tau(self.ion_name, p, self.wavelengths, 'Voigt')
+            self.tau_model += _model_tau_periodic(self.ion_name, p, self.wavelengths,
+                                                  self.mode, periodic=self._periodic)
+
+    @property
+    def _periodic(self):
+        """Whether the spectrum is treated as a periodic full box."""
+        return getattr(self, 'gal_velocity_pos', None) is None
 
     def get_fluxes_model(self):
         """
@@ -536,7 +576,8 @@ class Spectrum(object):
 
     def fit_profiles(self, vel_range, do_continuum_buffer=True, nbuffer=50,
                      chisq_lim=2.0, 
-                     chisq_factor=0.95, N_sigma_constr=3.0, max_lines=12):
+                     chisq_factor=0.95, N_sigma_constr=3.0, max_lines=12,
+                     mode=None):
         """
         Prepare the spectrum and fit Voigt profiles to all absorption regions.
 
@@ -566,7 +607,12 @@ class Spectrum(object):
             N_sigma_constr (float):      The model flux is constrained to exceed
                                          flux − N_sigma_constr × noise at every pixel.
             max_lines (int):             Maximum Voigt components allowed per region.
+            mode (str):                  Profile shape ('Voigt', 'Gaussian' or
+                                         'Lorentzian'); sets self.mode.  Defaults
+                                         to self.mode.
         """
+        if mode is not None:
+            self.mode = mode
         self.prepare_spectrum(vel_range, do_continuum_buffer=do_continuum_buffer,
                               nbuffer=nbuffer)
         self.regions_l, self.regions_i = find_regions(
@@ -579,7 +625,7 @@ class Spectrum(object):
             N_sigma_constr=N_sigma_constr,
             max_lines=max_lines,
             logN_bounds=self.logN_bounds,
-            b_bounds=self.b_bounds, mode='Voigt', verbose=self.verbose
+            b_bounds=self.b_bounds, mode=self.mode, verbose=self.verbose
         )
         if self.wrap_pixel > 0:
             # the fit was done on the rolled spectrum: move everything back
@@ -613,7 +659,8 @@ class Spectrum(object):
         self.get_fluxes_model()
         for i in range(len(self.line_list['N'])):
             p = np.array([self.line_list['N'][i], self.line_list['b'][i], self.line_list['l'][i]])
-            _tau_model = model_tau(self.ion_name, p, self.wavelengths)
+            _tau_model = _model_tau_periodic(self.ion_name, p, self.wavelengths,
+                                             self.mode, periodic=self._periodic)
             line_obj, = ax.plot(x_val, tau_to_flux(_tau_model), alpha=0.5, lw=1, ls='--')
             l_cent = self.line_list['l'][i]
             ax.axvline(l_cent, ymin=0.95, ymax=0.98, color=line_obj.get_color(), linestyle='-', linewidth=1)
@@ -1698,6 +1745,24 @@ def model_tau(ion_name, p, l, mode="Voigt"):
     return total_tau
 
 
+def _model_tau_periodic(ion_name, p, l, mode="Voigt", periodic=False):
+    """
+    model_tau(), plus (if periodic) the images of every line shifted by one box
+    width either way, for a spectrum whose uniform wavelength grid l spans a
+    whole periodic box.
+    """
+    tau = model_tau(ion_name, p, l, mode)
+    p = np.asarray(p, dtype=float).reshape(-1, 3)
+    if periodic and len(p) > 0:
+        l = np.asarray(l, dtype=float)
+        l_width = len(l) * (l[1] - l[0])
+        for shift in (-l_width, l_width):
+            images = p.copy()
+            images[:, 2] += shift
+            tau += model_tau(ion_name, images.ravel(), l, mode)
+    return tau
+
+
 def EquivalentWidth(fluxes, waves):
     """
     Compute the equivalent width of an absorption feature.
@@ -1721,6 +1786,12 @@ def EquivalentWidth(fluxes, waves):
     return float(np.sum((1.0 - fluxes) * dwave))
 
 
+def _h5_filename(spec_name):
+    """Spectrum file name: '.h5' is appended unless already present."""
+    spec_name = str(spec_name)
+    return spec_name if spec_name.endswith('.h5') else spec_name + '.h5'
+
+
 def write_spectrum(
     spec_name, line, LOS_pos, lambda_rest, redshift,
     vels, fluxes, taus, noise, col_dens, phys_dens, temps, mets, vpec,
@@ -1735,8 +1806,8 @@ def write_spectrum(
     fit_profiles().
 
     Args:
-        spec_name (str):         Output filename (without extension; '.h5' is
-                                 appended automatically).
+        spec_name (str):         Output filename; '.h5' is appended unless it
+                                 already ends in '.h5'.
         line (str):              Ion name, e.g. 'HI1215', stored as an attribute
                                  of the lambda_rest dataset.
         LOS_pos (list/array):    (x, y, z) position of the line of sight in
@@ -1764,7 +1835,7 @@ def write_spectrum(
     import os
     import h5py
 
-    filename = "%s.h5" % spec_name
+    filename = _h5_filename(spec_name)
     if os.path.isfile(filename) and not overwrite:
         if environment.verbose >= environment.VERBOSE_TACITURN:
             print(
@@ -1797,7 +1868,8 @@ def write_spectrum(
         hf.create_dataset("vpec",        data=np.array(vpec))
 
 
-def write_line_list(spec_name, line_list, regions_l, regions_i):
+def write_line_list(spec_name, line_list, regions_l, regions_i, mode="Voigt",
+                    periodic=False):
     """
     Append Voigt-profile fit results to an existing pygad spectrum HDF5 file.
 
@@ -1808,7 +1880,7 @@ def write_line_list(spec_name, line_list, regions_l, regions_i):
 
     Args:
         spec_name (str):       Path to the HDF5 spectrum file produced by
-                               write_spectrum().  Must contain 'lambda_rest'
+                               write_spectrum(), with or without the '.h5'.  Must contain 'lambda_rest'
                                (with 'ion_name' attribute) and 'wavelength'.
         line_list (dict):      Best-fit line parameters as returned by
                                fit_profiles_sat(), with keys:
@@ -1818,9 +1890,14 @@ def write_line_list(spec_name, line_list, regions_l, regions_i):
                                 of each absorption region (Å).
         regions_i (array-like): Shape (n_regions, 2); start and end pixel indices
                                 of each absorption region.
+        mode (str):            Profile shape the lines were fitted with, used
+                               for the model flux; stored as an attribute.
+        periodic (bool):       The spectrum spans a periodic box: lines near
+                               one edge also absorb at the other.
     """
     import h5py
 
+    spec_name = _h5_filename(spec_name)
     with h5py.File(spec_name, "r") as hf:
         line  = hf["lambda_rest"].attrs["ion_name"]
         waves = np.array(hf["wavelength"])
@@ -1828,7 +1905,7 @@ def write_line_list(spec_name, line_list, regions_l, regions_i):
     tau_model = np.zeros(len(waves))
     for i in range(len(line_list["N"])):
         p = np.array([line_list["N"][i], line_list["b"][i], line_list["l"][i]])
-        tau_model += model_tau(line, p, waves)
+        tau_model += _model_tau_periodic(line, p, waves, mode, periodic=periodic)
     model_flux = np.exp(-np.clip(tau_model, -30, 30))
 
     regions_l0 = [x[0] for x in regions_l]
@@ -1852,6 +1929,7 @@ def write_line_list(spec_name, line_list, regions_l, regions_i):
         elif "lines" in hf.keys():
             del hf["lines"]
         grp = hf.create_group("line_list")
+        grp.attrs["mode"] = mode
         grp.create_dataset("region",           data=np.array(line_list["region"], dtype=int))
         grp.create_dataset("logN",             data=np.array(N))
         grp.create_dataset("dlogN",            data=np.array(dN))
@@ -1898,7 +1976,8 @@ def fit_profiles(
     Args:
         line (str):               Line identifier as listed in
                                   analysis.absorption_spectra.lines, e.g. 'HI1215'.
-        spectrum_file (str):      Path to a pygad HDF5 spectrum file.  When
+        spectrum_file (str):      Path to a pygad HDF5 spectrum file (with or
+                                  without the '.h5' extension).  When
                                   provided, wavelengths, flux, noise, velocity, and
                                   redshift are read from the file and any arrays
                                   supplied via l/flux/noise are ignored.
@@ -1945,6 +2024,7 @@ def fit_profiles(
                            Spectrum.plot_fit().
     """
     if spectrum_file is not None:
+        spectrum_file = _h5_filename(spectrum_file)
         f = h5py.File(spectrum_file, 'r')
         if 'galaxy_properties/vlos' in f:
             gal_velocity_pos = float(np.array(f['galaxy_properties/vlos']))
@@ -1993,7 +2073,7 @@ def fit_profiles(
     spec = Spectrum(
         line, redshift, l, flux, noise, vel,
         gal_velocity_pos=gal_velocity_pos,
-        logN_bounds=logN_bounds, b_bounds=b_bounds
+        logN_bounds=logN_bounds, b_bounds=b_bounds, mode=mode
     )
     spec.fit_profiles(
         vel_range=vel_range, chisq_lim=chisq_lim,
@@ -2001,7 +2081,8 @@ def fit_profiles(
         max_lines=max_lines, N_sigma_constr=N_sigma_constr
     )
     if write_lines:
-        write_line_list(spectrum_file, spec.line_list, spec.regions_l, spec.regions_i)
+        write_line_list(spectrum_file, spec.line_list, spec.regions_l, spec.regions_i,
+                        mode=mode, periodic=spec._periodic)
     if plot_fit:
         spec.plot_fit()
 

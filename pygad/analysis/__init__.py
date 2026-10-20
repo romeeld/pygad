@@ -13,6 +13,8 @@ Also doctest other parts of this sub-module:
     TestResults(failed=0, attempted=19)
     >>> doctest.testmod(absorption_spectra)
     TestResults(failed=0, attempted=17)
+    >>> doctest.testmod(vpfit)
+    TestResults(failed=0, attempted=33)
 
     #>>> doctest.testmod(analysis)
     #TestResults(failed=0, attempted=20)

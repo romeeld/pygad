@@ -46,7 +46,7 @@ doctests:
     TestResults(failed=0, attempted=5)
     >>> print('testing module analysis...', file=sys.stderr)
     >>> doctest.testmod(analysis)
-    TestResults(failed=0, attempted=6)
+    TestResults(failed=0, attempted=7)
 
     #>>> print('testing module tools...', file=sys.stderr)
     #>>> doctest.testmod(.tools)

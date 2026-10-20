@@ -25,6 +25,77 @@ Pipeline
 
 Last edited: Romeel Dave, July 2026
 Contributors: Romeel Dave, Clara Lilje
+
+Doctests:
+    >>> environment.verbose = environment.VERBOSE_QUIET
+    >>> c_kms = float(c.in_units_of('km/s'))
+    >>> l_rest = 1215.6701
+
+    The optical depth of a redshifted line equals that of the same line at
+    rest on the corresponding (velocity-matched) grid:
+    >>> v = np.linspace(-100., 100., 201)
+    >>> tau_0 = model_tau('H1215', [13., 20., l_rest], l_rest * (1. + v / c_kms))
+    >>> tau_2 = model_tau('H1215', [13., 20., 3. * l_rest], 3. * l_rest * (1. + v / c_kms))
+    >>> print('%.4f %.4f' % (tau_0.max(), tau_2.max()))
+    0.3789 0.3789
+    >>> bool(np.allclose(tau_0, tau_2, rtol=1e-6))
+    True
+
+    Spectrum derives velocities from wavelengths:
+    >>> spec = Spectrum('H1215', 2.0, 3. * l_rest * (1. + np.array([0., 100., 200.]) / c_kms),
+    ...                 np.ones(3), np.full(3, 0.01), None, gal_velocity_pos=None,
+    ...                 logN_bounds=[12, 19], b_bounds=[5, 100])
+    >>> print(np.round(np.asarray(spec.velocities, dtype=float), 6))
+    [  0. 100. 200.]
+
+    write_spectrum converts velocities (km/s, or any velocity units) to
+    wavelengths, and honours overwrite=False:
+    >>> import os, shutil, tempfile
+    >>> tmpdir = tempfile.mkdtemp()
+    >>> spec_name = os.path.join(tmpdir, 'spec')
+    >>> def write(vels, overwrite=True):
+    ...     n = len(vels)
+    ...     write_spectrum(spec_name, 'H1215', [1., 2.], l_rest, 2.0, vels, np.ones(n),
+    ...                    np.zeros(n), np.full(n, 0.01), np.zeros(n), np.zeros(n),
+    ...                    np.zeros(n), np.zeros(n), np.zeros(n), overwrite=overwrite)
+    ...     with h5py.File(spec_name + '.h5', 'r') as hf:
+    ...         return np.array(hf['wavelength'])
+    >>> print(np.round(write(np.array([0., 1000.])), 3))
+    [3647.01  3659.175]
+    >>> print(np.round(write(UnitArr([0., 1e6], 'm/s')), 3))
+    [3647.01  3659.175]
+    >>> print(np.round(write(np.array([0., 2000.]), overwrite=False), 3))
+    [3647.01  3659.175]
+    >>> shutil.rmtree(tmpdir)
+
+    Fitting a full-box (periodic) spectrum returns line centres on the input
+    grid, also for a line crossing the box edge (at v=995 km/s, with the box
+    spanning 0-1000 km/s), and the model reproduces the input:
+    >>> vel = (np.arange(400) + 0.5) * 2.5
+    >>> l = 3. * l_rest * (1. + vel / c_kms)
+    >>> true = [(13.5, 25., 150.), (13., 20., 995.)]
+    >>> tau = np.zeros(len(vel))
+    >>> for logN, b, v0 in true:
+    ...     for shift in (-1000., 0., 1000.):
+    ...         tau += model_tau('H1215', [logN, b, 3. * l_rest * (1. + (v0 + shift) / c_kms)], l)
+    >>> flux, noise = np.exp(-tau), np.full(len(vel), 0.01)
+    >>> line_list = fit_profiles('H1215', l=l, vel=vel, flux=flux, noise=noise,
+    ...                          logN_bounds=[12, 15], b_bounds=[5, 100])
+    Fitting profiles for H1215 spectrum at z=2 with 400 pixels
+    >>> v_fit = wave_to_vel(np.asarray(line_list['l']), l_rest, 2.0)
+    >>> for (logN, b, v0), i in zip(true, np.argsort(v_fit)):
+    ...     print(abs(line_list['N'][i] - logN) < 0.05, abs(v_fit[i] - v0) < 5.)
+    True True
+    True True
+    >>> spec = Spectrum('H1215', 2.0, l, flux, noise, vel, gal_velocity_pos=None,
+    ...                 logN_bounds=[12, 15], b_bounds=[5, 100])
+    >>> spec.fit_profiles(vel_range=0)
+    >>> spec.wrap_pixel > 0, bool(np.array_equal(spec.fluxes, flux))
+    (True, True)
+    >>> spec.get_fluxes_model()
+    >>> bool(np.max(np.abs(spec.fluxes_model - flux)) < 0.01)
+    True
+    >>> environment.verbose = environment.VERBOSE_NORMAL
 """
 
 __all__ = [
@@ -143,7 +214,7 @@ class Spectrum(object):
         if vel is not None:
             wave = lambda_rest * (redshift + 1.0) * (1.0 + vel / float(c.in_units_of('km/s')))
         elif l is not None:
-            vel = l / (lambda_rest * (redshift + 1.0)) * float(c.in_units_of('km/s')) - 1.0
+            vel = (l / (lambda_rest * (redshift + 1.0)) - 1.0) * float(c.in_units_of('km/s'))
             wave = l
         else:
             raise ValueError('One of l or vel must be provided.')
@@ -156,7 +227,7 @@ class Spectrum(object):
         self.redshift = redshift
         self.velocities = vel
         self.continuum = np.ones(len(self.wavelengths))
-        self.verbose = (environment.verbose >= environment.VERBOSE_QUIET)
+        self.verbose = (environment.verbose > environment.VERBOSE_QUIET)
         if self.verbose:
             print('N,b bounds:', self.logN_bounds, self.b_bounds)
 
@@ -311,24 +382,35 @@ class Spectrum(object):
             print("Periodically wrapping spectrum, starting_pixel= %d" % starting_pixel)
         return flux, noise, starting_pixel
 
-    def periodic_unwrap_wavelength(self):
+    def periodic_unwrap_wavelength(self, l=None):
         """
-        Restore wavelengths to their original values after periodic_wrap().
+        Map wavelengths measured on the periodically wrapped spectrum back to
+        the original (unwrapped) wavelength grid.
 
-        After periodic_wrap() the wavelength array is no longer aligned with
-        the rolled flux/noise arrays.  This routine shifts the wavelengths so
-        that index 0 corresponds to wrap_pixel, and wraps any values that
-        overflow the right-hand edge of the simulation box back to the left.
+        After periodic_wrap() the rolled flux/noise arrays are fitted against
+        the unchanged self.wavelengths, so a feature at wavelength l in the
+        fit lies wrap_pixel pixels further along in the original spectrum.
+        This routine applies that shift and wraps values that overflow the
+        right-hand edge of the (periodic) box back to the left.  The
+        wavelength grid is assumed to be uniform, as it is for spectra that are
+        uniform in velocity.
+
+        Args:
+            l (array-like):   Wavelengths (Å) on the wrapped spectrum, e.g.
+                              fitted line centres.  Defaults to
+                              self.wavelengths.
 
         Returns:
-            l (numpy array):  Corrected wavelength array in the same units as
-                              self.wavelengths.
+            l (numpy array):  Corresponding wavelengths (Å) on the original
+                              grid, within [l_0, l_0 + box width).
         """
-        l = self.wavelengths
-        l_box = l[-1] + (l[-1]-l[-2])
-        l = l - l[0] + l[self.wrap_pixel]
-        l = np.where(l > l_box, l - l_box, l)
-        return l
+        waves = np.asarray(self.wavelengths, dtype=float)
+        if l is None:
+            l = waves
+        l = np.asarray(l, dtype=float)
+        l_width = len(waves) * (waves[1] - waves[0])
+        shift = waves[self.wrap_pixel] - waves[0]
+        return waves[0] + np.mod(l - waves[0] + shift, l_width)
 
     def prepare_spectrum(self, vel_range, do_continuum_buffer=True, nbuffer=50):
         """
@@ -362,15 +444,18 @@ class Spectrum(object):
             if i_start < 0:
                 i_start += len(self.wavelengths)
                 i_end += len(self.wavelengths)
+            fluxes, noise = self.fluxes, self.noise
         else:
-            self.fluxes, self.noise, self.wrap_pixel = self.periodic_wrap()
+            # keep self.fluxes/self.noise on the original grid; only the
+            # arrays handed to the fitter are wrapped
+            fluxes, noise, self.wrap_pixel = self.periodic_wrap()
             i_start = 0
             i_end = len(self.wavelengths)
             N = i_end - i_start
 
         self.waves_fit  = self.wavelengths.take(range(i_start, i_end), mode='wrap')
-        self.fluxes_fit = self.fluxes.take(range(i_start, i_end), mode='wrap')
-        self.noise_fit = self.noise.take(range(i_start, i_end), mode='wrap')
+        self.fluxes_fit = fluxes.take(range(i_start, i_end), mode='wrap')
+        self.noise_fit = noise.take(range(i_start, i_end), mode='wrap')
 
         i_wrap = len(self.wavelengths) - i_start
         wave_boxsize = self.wavelengths[-1] - self.wavelengths[0]
@@ -384,39 +469,42 @@ class Spectrum(object):
             )
 
 
-    def fit_periodic_spectrum(self):
+    def fit_periodic_spectrum(self, vel_range, **kwargs):
         """
         Fit Voigt profiles to a spectrum that spans the entire simulation volume.
 
-        Periodically wraps the spectrum so that the highest-flux pixel is at
-        index 0, delegates to pg.analysis.fit_profiles(), then unwraps the
-        fitted line wavelengths back to their original positions.  Any lines
-        outside the velocity range ±vel_range around self.gal_velocity_pos are
-        removed from the final line list.
+        Fits the whole periodically wrapped spectrum (see fit_profiles() with
+        gal_velocity_pos unset), adds the line velocities as
+        self.line_list['v'], and, if self.gal_velocity_pos is set, keeps only
+        the lines within ±vel_range of it (measured periodically).
+
+        Args:
+            vel_range (float):  Half-width (km/s) of the velocity window around
+                                self.gal_velocity_pos whose lines are kept.
+            **kwargs:           Passed on to fit_profiles().
 
         Sets:
             self.line_list (dict): Best-fit line parameters with keys
                                    ['N', 'dN', 'b', 'db', 'l', 'dl', 'EW',
-                                   'Chisq', 'region'].
+                                   'Chisq', 'region', 'v'].
         """
-        wrap_flux, wrap_noise, wrap_start = self.periodic_wrap()
-        self.line_list = pg.analysis.fit_profiles(
-            self.ion_name, self.wavelengths, wrap_flux, wrap_noise,
-            chisq_lim=2.0, max_lines=10,
-            logN_bounds=self.logN_bounds, b_bounds=self.b_bounds, mode='Voigt'
-        )
-        self.line_list['l'] = pg.analysis.periodic_unwrap_wavelength(
-            self.line_list['l'], self.wavelengths, wrap_start
-        )
-        self.line_list['v'] = wave_to_vel(
-            self.line_list['l'], self.lambda_rest, self.redshift
-        )
-        outwith_vel_mask = ~(
-            (self.line_list['v'] > self.gal_velocity_pos - vel_range) &
-            (self.line_list['v'] < self.gal_velocity_pos + vel_range)
-        )
-        for k in self.line_list.keys():
-            self.line_list[k] = np.delete(self.line_list[k], outwith_vel_mask)
+        gal_velocity_pos = getattr(self, 'gal_velocity_pos', None)
+        self.gal_velocity_pos = None
+        try:
+            self.fit_profiles(vel_range, **kwargs)
+        finally:
+            self.gal_velocity_pos = gal_velocity_pos
+        line_list = {k: np.asarray(v) for k, v in self.line_list.items()}
+        line_list['v'] = np.asarray(wave_to_vel(
+            line_list['l'], float(self.lambda_rest), self.redshift
+        ), dtype=float)
+        if gal_velocity_pos is not None:
+            vel = np.asarray(self.velocities, dtype=float)
+            v_box = len(vel) * (vel[1] - vel[0])
+            dv = np.mod(line_list['v'] - gal_velocity_pos + 0.5 * v_box, v_box) - 0.5 * v_box
+            keep = np.abs(dv) < vel_range
+            line_list = {k: v[keep] for k, v in line_list.items()}
+        self.line_list = line_list
 
     def get_tau_model(self):
         """
@@ -460,9 +548,12 @@ class Spectrum(object):
             4. periodic_unwrap_wavelength() — restore wavelengths if wrapped.
 
         Sets the following instance attributes after returning:
-            self.line_list (dict): Best-fit line parameters.
+            self.line_list (dict): Best-fit line parameters.  Line centres 'l'
+                                   are on the original wavelength grid.
             self.regions_l (numpy array): Wavelength boundaries of each region.
             self.regions_i (numpy array): Pixel boundaries of each region.
+            For a periodically wrapped spectrum both region arrays refer to the
+            original grid, and a region crossing the box edge has start > end.
 
         Args:
             vel_range (float):           Half-width of the velocity window (km/s).
@@ -476,7 +567,8 @@ class Spectrum(object):
                                          flux − N_sigma_constr × noise at every pixel.
             max_lines (int):             Maximum Voigt components allowed per region.
         """
-        self.prepare_spectrum(vel_range, do_continuum_buffer=True, nbuffer=50)
+        self.prepare_spectrum(vel_range, do_continuum_buffer=do_continuum_buffer,
+                              nbuffer=nbuffer)
         self.regions_l, self.regions_i = find_regions(
             self.waves_fit, self.fluxes_fit, self.noise_fit, verbose=self.verbose
         )
@@ -490,7 +582,13 @@ class Spectrum(object):
             b_bounds=self.b_bounds, mode='Voigt', verbose=self.verbose
         )
         if self.wrap_pixel > 0:
-            l = self.periodic_unwrap_wavelength()
+            # the fit was done on the rolled spectrum: move everything back
+            self.line_list["l"] = self.periodic_unwrap_wavelength(self.line_list["l"])
+            if len(self.regions_l) > 0:
+                self.regions_l = self.periodic_unwrap_wavelength(self.regions_l)
+                i_offset = self.wrap_pixel - (nbuffer if do_continuum_buffer else 0)
+                self.regions_i = np.mod(np.asarray(self.regions_i) + i_offset,
+                                        len(self.wavelengths))
 
     def plot_fit(self, ax=None):
         """
@@ -1586,9 +1684,15 @@ def model_tau(ion_name, p, l, mode="Voigt"):
     line = lines[ion_name]
     if len(p) == 0:
         return total_tau
+    l = np.asarray(l, dtype=float)
+    l_rest = float(UnitScalar(line["l"], "Angstrom"))
     for ip in range(int(len(p) / 3)):
+        # Evaluate in the rest frame: the cross-section scales with the rest
+        # wavelength, not the observed λ, while l * l_rest / λ preserves the
+        # velocity offsets (as in tau_lookup).
         _, tau = line_profile(
-            line, 10 ** p[ip * 3], b=p[ip * 3 + 1], l0=p[ip * 3 + 2], l=l, mode=mode
+            line, 10 ** p[ip * 3], b=p[ip * 3 + 1], l0=l_rest,
+            l=l * (l_rest / p[ip * 3 + 2]), mode=mode
         )
         total_tau += tau
     return total_tau
@@ -1640,7 +1744,8 @@ def write_spectrum(
                                  they are assumed to be (x, y) and z is set to -1.
         lambda_rest (float):     Rest wavelength of the ion (Å).
         redshift (float):        Redshift of the simulation snapshot.
-        vels (array-like):       LOS velocities of each pixel (km/s).
+        vels (array-like):       LOS velocities of each pixel (km/s if given
+                                 without units).
         fluxes (array-like):     Normalised fluxes of each pixel, including any
                                  noise and instrumental smoothing applied.
         taus (array-like):       Optical depths of each pixel.
@@ -1659,20 +1764,23 @@ def write_spectrum(
     import os
     import h5py
 
-    if os.path.isfile(spec_name) and not overwrite:
+    filename = "%s.h5" % spec_name
+    if os.path.isfile(filename) and not overwrite:
         if environment.verbose >= environment.VERBOSE_TACITURN:
             print(
                 "WARNING: write_spectrum() failed: File %s exists, and overwrite set to False"
-                % spec_name
+                % filename
             )
         return
 
-    waves = lambda_rest * (redshift + 1.0) * (1.0 + vels / c)
+    vels = np.asarray(UnitQty(vels, "km/s").in_units_of("km/s"), dtype=float)
+    lambda_rest = float(UnitScalar(lambda_rest, "Angstrom"))
+    waves = lambda_rest * (redshift + 1.0) * (1.0 + vels / float(c.in_units_of("km/s")))
     mets  = np.log10(np.where(mets < 1.0e-10, 1.0e-10, mets))
     if len(LOS_pos) == 2:
         LOS_pos = np.append(np.array(LOS_pos), -1.0)
 
-    with h5py.File("%s.h5" % spec_name, "w") as hf:
+    with h5py.File(filename, "w") as hf:
         lam0 = hf.create_dataset("lambda_rest", data=lambda_rest)
         lam0.attrs["ion_name"] = line
         hf.create_dataset("LOS_pos",     data=np.array(LOS_pos))
@@ -1795,9 +1903,11 @@ def fit_profiles(
                                   redshift are read from the file and any arrays
                                   supplied via l/flux/noise are ignored.
         l (array-like):           Wavelength array (Å).  Required when
-                                  spectrum_file is None.
-        vel (array-like):         Velocity array (km/s).  Used to derive l when
-                                  both l and vel are provided.
+                                  spectrum_file is None.  Without vel, the
+                                  redshift is taken from l[0], i.e. the first
+                                  pixel is assumed to be at zero velocity.
+        vel (array-like):         Velocity array (km/s).  When given with l, the
+                                  redshift is derived from l[0] and vel[0].
         flux (array-like):        Normalised flux array.  Required when
                                   spectrum_file is None.
         noise (array-like):       1-sigma noise array.  Required when
@@ -1828,14 +1938,17 @@ def fit_profiles(
         plot_fit (bool):          Plot spectrum with fitted lines.
 
     Returns:
-        None.  Results are written to spectrum_file via write_line_list() and
-        displayed via Spectrum.plot_fit().
+        line_list (dict):  Best-fit line parameters (see fit_profiles_sat()),
+                           with line centres on the input wavelength grid.
+                           Optionally also written to spectrum_file via
+                           write_line_list() and displayed via
+                           Spectrum.plot_fit().
     """
     if spectrum_file is not None:
         f = h5py.File(spectrum_file, 'r')
-        try:
-            gal_velocity_pos = np.array(f['galaxy_properties/vlos'])
-        except:
+        if 'galaxy_properties/vlos' in f:
+            gal_velocity_pos = float(np.array(f['galaxy_properties/vlos']))
+        else:
             gal_velocity_pos = gal_v_pos
         if gal_velocity_pos is None or vel_range <= 0:
             print('Fitting full-box periodic spectrum from file', spectrum_file)
@@ -1847,20 +1960,30 @@ def fit_profiles(
         noise    = np.array(f['noise'])
         #noise = np.where(noise < 0.03333, 0.03333, noise)
         vel      = np.array(f['velocity'])
-        redshift = np.array(f['redshift'])
+        redshift = float(np.array(f['redshift']))
         f.close()
     elif line is not None and l is not None:
         if isinstance(line, str):
             line_struct = lines[line]
-            lambda_rest = UnitScalar(line_struct["l"], 'Angstrom')
-            redshift = l[0] / lambda_rest - 1
+            lambda_rest = float(UnitScalar(line_struct["l"], 'Angstrom'))
+            l = np.asarray(l, dtype=float)
+            if vel is not None:
+                # consistent with the wavelengths Spectrum rebuilds from vel
+                vel = np.asarray(vel, dtype=float)
+                c_kms = float(c.in_units_of('km/s'))
+                redshift = float(l[0] / (lambda_rest * (1.0 + vel[0] / c_kms)) - 1.0)
+            else:
+                # assumes the first pixel is at zero velocity
+                redshift = float(l[0] / lambda_rest - 1.0)
         else:
             raise ValueError('Could not find line %s in database.' % line)
+        gal_velocity_pos = gal_v_pos
         print('Fitting profiles for %s spectrum at z=%g with %d pixels' % (line, redshift, len(l)))
     else:
         raise ValueError('Must provide either spectrum_file or [wave, flux, noise, vel]')
 
-    gal_velocity_pos = None
+    if vel_range <= 0:
+        gal_velocity_pos = None
 
     if b_bounds[0] == 0.:
         T       = UnitScalar(1.e4, "K")

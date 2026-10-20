@@ -9,15 +9,22 @@ NUMERIC_REL_TOL = 5e-6
 NUMERIC_ABS_TOL = 1e-12
 
 
+_NUMBER_RE = r"[-+]?[.]?[\d]+(?:,\d\d\d)*[\.]?\d*(?:[eE][-+]?\d+)?"
+
+
 def string_to_numbers(string: str):
     """
     Convert a string to a list of numbers.
     Use refex to find numbers, integers and floats.
     https://stackoverflow.com/a/29581287/633093
     """
-    numbers = re.findall(
-        r"[-+]?[.]?[\d]+(?:,\d\d\d)*[\.]?\d*(?:[eE][-+]?\d+)?", string)
+    numbers = re.findall(_NUMBER_RE, string)
     return numbers
+
+
+def _non_numeric_text(string: str):
+    """The text around the numbers, ignoring whitespace (array padding)."""
+    return re.sub(r"\s+", "", re.sub(_NUMBER_RE, "#", string))
 
 
 def _without_array_shape(string: str):
@@ -28,6 +35,7 @@ def _without_array_shape(string: str):
 def _without_numpy_scalar_wrapper(string: str):
     """Normalize NumPy scalar reprs, which vary between NumPy releases."""
     string = re.sub(r"np\.(?:float|int|uint)\d+\(([^()]*)\)", r"\1", string)
+    string = re.sub(r"np\.(True|False)_", r"\1", string)
     return re.sub(r"np\.void\((\([^)]*\)), dtype=.*\)", r"\1", string)
 
 
@@ -100,6 +108,11 @@ def check_output_numbers(self, want, got, optionflags):
     # print(f"want = {want}")
     # NumPy versions differ in whether they append ``shape=(...)`` to array
     # representations.  It is metadata, not part of the numerical result.
+    # The text around the numbers has to match as well (ignoring whitespace);
+    # otherwise e.g. 'True' and 'False' -- or any two outputs without
+    # numbers -- would be considered equal.
+    if _non_numeric_text(got) != _non_numeric_text(want):
+        return False
     got_numbers = string_to_numbers(got)
     want_numbers = string_to_numbers(want)
     # print(f"got_numbers = {got_numbers}")

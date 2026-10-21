@@ -55,13 +55,17 @@ The canonical scripted setup is `.devcontainer/setup.sh` (used by the devcontain
 | Gate | Command | What it checks | Notes |
 |---|---|---|---|
 | **Doctest suite (primary)** | `.venv/bin/python runTestsAll.py` | doctests across every submodule | Takes a few minutes. **Exit code = number of failed doctests** (0 = pass). Needs auxiliary data + the C extension. |
-| **Regression tests** | `.venv/bin/python tests/test_bugfixes.py` | 3 historical bug fixes (units div, derive cache, cfg undefine) | Fast (~1 s). No auxiliary data needed beyond import. |
+| **Regression tests** | `.venv/bin/python tests/test_bugfixes.py` | historical bug fixes (units div, derive cache, cfg undefine, self-shielded nH cache, two-LOS spectra, `plot_fit` figure handling) | Fast (a few s). Some checks need the ion tables and test snapshots from the auxiliary data. |
 | **Plotting smoke** | `cp tests/QuickStart.py . && .venv/bin/python QuickStart.py` | end-to-end plotting pipeline | Needs a non-interactive backend; heavy. |
 | **Lint** | `ruff check pygad/` | static checks | **Currently 754 findings.** ruff is available but the CI ruff step is **commented out**. Don't treat ruff cleanliness as a gate today. |
 | **Import health** | `.venv/bin/python -c "import pygad"` | bootstrap + data + C ext load | The devcontainer script's final check. |
 
 ### Doctest infra caveat (important)
 Tests are **doctests**, run through a **custom numeric checker** in `pygad/doctest/doctest.py` (`NumericOutputChecker`). It **normalizes away** array `shape=(...)` metadata and numpy scalar wrappers (`np.float64`, `np.void`) before comparison, and compares floats with `rel_tol=2e-6`/`abs_tol=1e-12`. Consequence: doctests will **not** catch shape regressions or dtype changes (e.g. `float32` vs `float64`). See `DOCTEST_FAILURES.md` for the history of why each normalization was added. When you add doctests, be aware they are lenient on shape/type.
+
+The text *around* the numbers must match (ignoring whitespace, so NumPy column padding is fine); `np.True_`/`np.False_` are normalised like other NumPy scalar reprs. Before commit `00cb929` the checker compared numbers only, so outputs without numbers (`True` vs `False`, strings) always passed — expected values in old doctests were never really checked on text.
+
+Doctests expect the **stock** config. A user config in `~/.config/pygad/` (read before the repo defaults) changes derived blocks and breaks expected values — run the suite with `HOME` pointed at an empty directory if one exists.
 
 ## Repo layout
 
@@ -92,6 +96,7 @@ tracing/               gtracepy3, gtracegaspy3 — gas-tracing pipeline scripts
 commands/              CmdCatalog.py, CmdStarform.py, CmdTraceGas.py
 bin/                   ginsp, gconv, gCache3, gCatalog3, gStarform3 — installed console scripts
 tests/                 test_bugfixes.py, QuickStart.py
+scripts/               random_los_spectra.py — N random periodic LOS spectra for several lines + optional parallel Voigt fitting (vpfit); see its docstring for output layout and Simba/GIZMO checks (--gizmo)
 runTestsAll.py         doctest runner entry point
 setup.py               builds cpygad.so via Extension; Darwin libomp detection; versioneer
 ```

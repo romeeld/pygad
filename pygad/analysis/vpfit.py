@@ -148,7 +148,7 @@ from .physics import wave_to_vel, vel_to_wave, tau_to_flux
 from .utils import read_h5_into_dict
 from scipy import signal
 import scipy
-from scipy.optimize import minimize, NonlinearConstraint
+from scipy.optimize import least_squares
 plt.rcParams['text.usetex'] = False
 
 
@@ -701,11 +701,20 @@ def fit_profiles_sat(
     """
     Fit Voigt/other profiles to a set of pre-identified absorption regions.
 
-    Begins with a single component per region, adding lines iteratively until
-    the reduced chi-squared falls below chisq_lim or max_lines is reached.
-    After the per-region fit, the full-spectrum line list is refined by
-    attempting to remove or combine redundant lines and by slightly reducing
-    all column densities if that improves the global chi-squared.
+    Each region starts with a single component; components are added one at
+    a time (at the deepest residual, or by splitting an existing component)
+    and all components of the region are refitted by least squares after
+    every change.  A component is only kept when it lowers the total χ² by at
+    least _DCHISQ_PER_LINE (the Akaike information criterion for its three
+    parameters); afterwards insignificant components are removed or merged.
+    Finally all components of the spectrum are refitted jointly, so the wings
+    of neighbouring regions are accounted for.
+
+    Line centres are fitted as velocity offsets, which keeps the problem well
+    conditioned.  For a single saturated line in the flat part of the curve of
+    growth (HI with 10^14.5 ≲ N ≲ 10^18 cm⁻²) N and b are strongly correlated
+    and only weakly constrained by one transition; blends of such lines can be
+    indistinguishable from one broader line.  Use the errors dN, db.
 
     Args:
         ion_name (str):             The line to fit as listed in
@@ -719,16 +728,15 @@ def fit_profiles_sat(
                                     find_regions().
         regions_i (numpy array):    Shape (n_regions, 2); start and end pixel
                                     indices of each absorption region.
-        chisq_lim (float):          Reduced χ² threshold for a satisfactory fit.
-                                    No more lines are added once χ² < chisq_lim.
-        chisq_factor (float):       A newly added line is accepted only when it
-                                    reduces χ² by at least this factor (≤ 1).
-        N_sigma_constr (float):     The constrained minimiser requires the model
-                                    flux to exceed flux − N_sigma_constr × noise
-                                    at every pixel.
-        max_lines (int):            Maximum Voigt components per absorption region.
-                                    If reached the fit is declared done regardless
-                                    of χ², which may yield a poor result.
+        chisq_lim (float):          Not used any more (components are added
+                                    while they are significant); kept for
+                                    backwards compatibility.
+        chisq_factor (float):       A new component must also reduce the total
+                                    χ² of its region by at least this factor (≤ 1).
+        N_sigma_constr (float):     Not used any more (the fit is unconstrained
+                                    apart from the parameter bounds); kept for
+                                    backwards compatibility.
+        max_lines (int):            Maximum components per absorption region.
         mode (str):                 Profile shape: 'Voigt', 'Gaussian', or
                                     'Lorentzian'.  See absorption_spectra.line_profile().
         logN_bounds (list):         [min, max] allowed log₁₀ column density (cm⁻²).
@@ -739,23 +747,26 @@ def fit_profiles_sat(
         line_list (dict):  Best-fit parameters for all detected lines, with keys:
                              'region' (int)   — absorption region index.
                              'N'      (float) — log₁₀ column density (cm⁻²).
-                             'dN'     (float) — 1-sigma uncertainty on N.
+                             'dN'     (float) — 1-sigma uncertainty on N
+                                                (from the final joint fit).
                              'b'      (float) — Doppler parameter (km/s).
                              'db'     (float) — 1-sigma uncertainty on b.
                              'l'      (float) — central wavelength (Å).
                              'dl'     (float) — 1-sigma uncertainty on l.
                              'EW'     (float) — equivalent width (Å).
-                             'Chisq'  (float) — reduced χ² of the region fit.
+                             'Chisq'  (float) — reduced χ² of the final model
+                                                over the line's region.
     """
     from .tau_lookup import get_tau_lookup, model_tau_fast
     _lookup = get_tau_lookup(ion_name, mode)
-
-    np.set_printoptions(formatter={'float': '{:.4f}'.format})
 
     line = lines[ion_name]
     l0 = float(line["l"].split()[0])
     if isinstance(l, np.ndarray) or l.units in [1, None]:
         l = UnitArr(l, "Angstrom")
+    l     = np.asarray(l,     dtype=float)
+    flux  = np.asarray(flux,  dtype=float)
+    noise = np.asarray(noise, dtype=float)
 
     # ── Inner helper functions ────────────────────────────────────────────
 
@@ -778,66 +789,35 @@ def fit_profiles_sat(
         Returns:
             chisq (float): Reduced χ² (sum of squared residuals / non-zero pixels).
         """
-        model_flux = _tau_to_flux(model_tau_fast(ion_name, p, l, mode))
+        model_flux = _tau_to_flux(model_tau_fast(ion_name, p, l, mode, lookup=_lookup))
         dx_array = (flux - model_flux) / noise
-        return np.sum(dx_array * dx_array) / np.count_nonzero(dx_array)
+        return np.sum(dx_array * dx_array) / max(np.count_nonzero(dx_array), 1)
 
-    def _add_line(ion_name, p, bnd, l, flux, noise, l0, mode, i_line=None, grow_line=True):
+    def _add_line(p, l, flux, noise):
         """
-        Append a new Voigt component to the parameter and bounds arrays.
+        Append a new component to the flat parameter array.
 
-        Calls _grow_line() to estimate the best initial (logN, b) for the new
-        component, or falls back to a simple width-based heuristic when
-        grow_line=False.  The line is centred at the deepest point of the
-        current residual flux unless i_line is explicitly given.
+        The initial (logN, b) come from _grow_line() and the line is centred
+        at the deepest point of the current residual flux.
 
         Args:
-            ion_name (str):      Line identifier.
             p (numpy array):     Current flat parameter array [logN, b, λ₀, …].
-            bnd (numpy array):   Current bounds array, shape (3*n_lines, 2).
             l (numpy array):     Wavelength array of the fitting region (Å).
             flux (numpy array):  Observed flux in the fitting region.
             noise (numpy array): 1-sigma noise in the fitting region.
-            l0 (float):          Rest wavelength of the line (Å).
-            mode (str):          Profile type.
-            i_line (int | None): Pixel index for the new line centre.  Uses the
-                                 deepest residual pixel when None.
-            grow_line (bool):    Call _grow_line() to find the best (logN, b)
-                                 rather than using the simple heuristic.
 
         Returns:
-            p (numpy array):   Updated parameter array with new line appended.
-            bnd (numpy array): Updated bounds array with new line's bounds appended.
+            p (numpy array): Updated parameter array with the new line appended.
         """
         if len(p) == 0:
             resid = flux
         else:
-            resid = 1.0 + flux - _tau_to_flux(model_tau_fast(ion_name, p, l, mode))
-        l_bounds = [l[1], l[-2]]
-
-        if grow_line:
-            n_guess, b_guess, l_guess = _grow_line(
-                ion_name, l, flux, noise, resid, l0, mode, i_line=i_line
-            )
-        else:
-            b_guess = (l_bounds[1] - l_bounds[0]) / float(l0) * 3.0e5 / 5.0
-            b_guess = max(2 * b_bounds[0], 0.5 * min(b_bounds[1], b_guess))
-            n_guess = 14.0 - resid[np.argmin(resid)]
-            l_guess = l[np.argmin(resid)]
-
-        p = np.append(p, n_guess)
-        p = np.append(p, b_guess)
-        p = np.append(p, l_guess)
-
-        n_bounds = [n_guess-0.5, n_guess+0.5]
-        b_bounds_new = [b_guess*0.5, b_guess*2]
-        if len(bnd) == 0:
-            bnd = np.array([n_bounds])
-        else:
-            bnd = np.append(bnd, np.array([n_bounds]), axis=0)
-        bnd = np.append(bnd, np.array([b_bounds_new]), axis=0)
-        bnd = np.append(bnd, np.array([l_bounds]), axis=0)
-        return p, bnd
+            resid = 1.0 + flux - _tau_to_flux(model_tau_fast(ion_name, p, l, mode, lookup=_lookup))
+        n_guess, b_guess, l_guess = _grow_line(ion_name, l, flux, noise, resid, l0, mode)
+        if len(p) > 0 and np.any(np.isclose(np.asarray(p)[2::3], l_guess, rtol=0., atol=1e-9)):
+            # never start two components at exactly the same position
+            l_guess += 0.5 * (l[1] - l[0])
+        return np.append(p, [n_guess, b_guess, l_guess])
 
     def _grow_line(ion_name, l, flux, noise, resid, l0, mode,
                    i_line=None, floor_sigma=1.5, smooth_sigma=1., unsat_sigma=3.):
@@ -850,6 +830,7 @@ def fit_profiles_sat(
         calling model_tau_fast for every (logN, b) pair.  The combination with
         the lowest reduced χ² near the line core is returned, provided the
         model flux everywhere exceeds smoothed_residual − floor_sigma × noise.
+        This is only the starting point; the least-squares fit refines it.
 
         Args:
             ion_name (str):       Line identifier.
@@ -890,7 +871,7 @@ def fit_profiles_sat(
         for bpar in b_range:
             # Compute the profile shape once per b value via the lookup table;
             # subsequent N values need only a scalar multiply (no model call).
-            tau_unit   = model_tau_fast(ion_name, [0.0, bpar, l_line], l, mode)
+            tau_unit   = model_tau_fast(ion_name, [0.0, bpar, l_line], l, mode, lookup=_lookup)
 
             for Ncol in N_range:
                 tau_trial  = (10.0 ** Ncol) * tau_unit
@@ -915,66 +896,64 @@ def fit_profiles_sat(
 
         return best_N, best_b, l_line
 
-    def _maxiter(n, nmax):
+    def _split_line(p, i):
+        """Replace component i by two narrower, weaker ones at λ ± b/2."""
+        logN, b, l_c = p[3*i:3*i+3]
+        dl = 0.5 * b / _lookup.c_kms * l_c
+        new = [logN - 0.3, 0.7 * b, l_c - dl, logN - 0.3, 0.7 * b, l_c + dl]
+        return np.append(np.delete(p, [3*i, 3*i+1, 3*i+2]), new)
+
+    def _fit(p, l, flux, noise):
+        """Least-squares fit of all components in p; see _lsq_fit_lines()."""
+        return _lsq_fit_lines(_lookup, p, l, flux, noise, logN_bounds, b_bounds)
+
+    def _chisq_tot(p, l, flux, noise):
+        """Total (not reduced) χ² of the model p."""
+        model_flux = _tau_to_flux(model_tau_fast(ion_name, p, l, mode, lookup=_lookup))
+        return float(np.sum(((flux - model_flux) / noise) ** 2))
+
+    def _prune(p, l, flux, noise, label):
         """
-        Return the maximum minimiser iterations for a fit with n components.
+        Remove or merge components that are not significant (AIC).
 
-        Grants more iterations for small line counts where accuracy matters
-        most, tapering toward nmax to bound runtime for complex fits.
-
-        Args:
-            n (int):    Current number of Voigt components.
-            nmax (int): Maximum components allowed in this region.
+        Each component is tentatively removed (also the last one), and each
+        pair of neighbouring components tentatively merged into one; the rest
+        is refitted, and the simpler model is kept when it raises the total χ²
+        by less than _DCHISQ_PER_LINE.  Repeats until nothing changes.
 
         Returns:
-            maxiter (int): Maximum number of minimiser iterations to allow.
+            p (numpy array): The pruned, refitted parameter array.
         """
-        if n <= 5: return 100
-        else: return max(50, 50+(nmax-n)*10)
+        chi2 = _chisq_tot(p, l, flux, noise)
+        changed = True
+        while changed and len(p) > 0:
+            changed = False
+            n_lines = len(p) // 3
+            trials = []
+            for i in np.argsort(p[0::3]):              # weakest first
+                trials.append(("removed line %d (N=%.3f)" % (i, p[3*i]),
+                               np.delete(p, [3*i, 3*i+1, 3*i+2])))
+            order = np.argsort(p[2::3])
+            for j in range(n_lines - 1):
+                i, k = order[j], order[j+1]
+                N_i, N_k = 10**p[3*i], 10**p[3*k]
+                merged = [np.log10(N_i + N_k),
+                          (N_i * p[3*i+1] + N_k * p[3*k+1]) / (N_i + N_k),
+                          (N_i * p[3*i+2] + N_k * p[3*k+2]) / (N_i + N_k)]
+                trial = np.delete(p, [3*i, 3*i+1, 3*i+2, 3*k, 3*k+1, 3*k+2])
+                trials.append(("merged lines %d and %d (N=%.3f, %.3f)" % (i, k, p[3*i], p[3*k]),
+                               np.append(trial, merged)))
+            for what, trial in trials:
+                trial, _ = _fit(trial, l, flux, noise)
+                chi2_trial = _chisq_tot(trial, l, flux, noise)
+                if chi2_trial - chi2 < _DCHISQ_PER_LINE:
+                    if verbose:
+                        print("%s: %s, chisq_tot %.1f -> %.1f" % (label, what, chi2, chi2_trial))
+                    p, chi2, changed = trial, chi2_trial, True
+                    break
+        return p
 
-    def _model_flux(p):
-        """
-        Return the model flux for the current region given parameter array p.
-
-        Thin wrapper around model_tau_fast used as the callable for
-        NonlinearConstraint in the constrained minimisation step.
-
-        Args:
-            p (numpy array): Flat parameter array [logN, b, λ₀, …].
-
-        Returns:
-            model_flux (numpy array): Normalised model flux at each pixel of l_reg.
-        """
-        return _tau_to_flux(model_tau_fast(ion_name, p, l_reg, mode, lookup=_lookup))
-
-    def _constraint_jac(p):
-        """
-        Jacobian of _model_flux w.r.t. the parameter array p.
-
-        Computed via forward finite differences with a step proportional to
-        √(machine epsilon).  Supplying this to NonlinearConstraint avoids
-        scipy's own internal finite-difference calls and reduces the total
-        number of model evaluations per minimiser iteration.
-
-        Args:
-            p (numpy array): Flat parameter array [logN, b, λ₀, …], length 3*n.
-
-        Returns:
-            jac (numpy array): Jacobian of shape (n_pixels, 3*n).
-        """
-        eps   = np.sqrt(np.finfo(float).eps)
-        n_p   = len(p)
-        n_pix = len(l_reg)
-        jac   = np.empty((n_pix, n_p))
-        f0    = _tau_to_flux(model_tau_fast(ion_name, p, l_reg, mode, lookup=_lookup))
-        for j in range(n_p):
-            dp        = np.zeros(n_p)
-            dp[j]     = eps * max(abs(p[j]), 1.0)
-            f_plus    = _tau_to_flux(model_tau_fast(ion_name, p + dp, l_reg, mode, lookup=_lookup))
-            jac[:, j] = (f_plus - f0) / dp[j]
-        return jac
-
-    # ── Main fitting loop (code unchanged below) ──────────────────────────
+    # ── Fit each region ───────────────────────────────────────────────────
 
     line_list = {
         "region": np.array([], dtype=int),
@@ -987,430 +966,165 @@ def fit_profiles_sat(
         "EW": np.array([]),
         "Chisq": np.array([])
     }
+    params_all = np.array([])
+    region_of  = np.array([], dtype=int)
 
     for ireg in range(len(regions_l)):
-
-        params = []
-        bounds = []
-        n_lines = 0
-        best_nlines = 1
-        chisq_old = 1.0e20
-        chisq_accept = abs(chisq_lim)
         l_reg = l[regions_i[ireg, 0] : regions_i[ireg, 1]]
         f_reg = flux[regions_i[ireg, 0] : regions_i[ireg, 1]]
         n_reg = noise[regions_i[ireg, 0] : regions_i[ireg, 1]]
+        if len(l_reg) < 4:
+            continue
 
-        regions_l_sat, regions_i_sat, bounding_i = find_saturated_regions(
-            l_reg, f_reg, n_reg, min_region_width=15, verbose=verbose
-        )
-        bounding_i = []
-
-        params_reg = []
-        bounds_reg = []
-        best_nlines = 0
-        if len(bounding_i) != 0:
+        # Add components one at a time and refit all of them, until a new
+        # component is no longer significant.  A new component either goes at
+        # the deepest residual or comes from splitting an existing one (for
+        # blends whose residual has no clear minimum); the best fit is kept.
+        params, _ = _fit(_add_line(np.array([]), l_reg, f_reg, n_reg), l_reg, f_reg, n_reg)
+        chi2_tot = _chisq_tot(params, l_reg, f_reg, n_reg)
+        while len(params) // 3 < max_lines:
+            candidates = [_add_line(params, l_reg, f_reg, n_reg)]
+            candidates += [_split_line(params, i) for i in range(len(params) // 3)]
+            trial, chi2_trial = None, np.inf
+            for cand in candidates:
+                cand, _ = _fit(cand, l_reg, f_reg, n_reg)
+                chi2_cand = _chisq_tot(cand, l_reg, f_reg, n_reg)
+                if chi2_cand < chi2_trial:
+                    trial, chi2_trial = cand, chi2_cand
             if verbose:
-                print('Region %d has %d saturated area(s) at pixels:'%(ireg, len(regions_i_sat)), regions_i_sat)
-            for ireg_sat in range(len(regions_l_sat)):
-                l_reg_sat = l_reg[regions_i_sat[ireg_sat, 0] : regions_i_sat[ireg_sat, 1]]
-                f_reg_sat = f_reg[regions_i_sat[ireg_sat, 0] : regions_i_sat[ireg_sat, 1]]
-                n_reg_sat = n_reg[regions_i_sat[ireg_sat, 0] : regions_i_sat[ireg_sat, 1]]
-
-                l_reg_bound_left  = l_reg[bounding_i[ireg_sat, 0][0] : bounding_i[ireg_sat, 0][1]]
-                l_reg_bound_right = l_reg[bounding_i[ireg_sat, 1][0] : bounding_i[ireg_sat, 1][1]]
-                f_reg_bound_left  = f_reg[bounding_i[ireg_sat, 0][0] : bounding_i[ireg_sat, 0][1]]
-                f_reg_bound_right = f_reg[bounding_i[ireg_sat, 1][0] : bounding_i[ireg_sat, 1][1]]
-                n_reg_bound_left  = n_reg[bounding_i[ireg_sat, 0][0] : bounding_i[ireg_sat, 0][1]]
-                n_reg_bound_right = n_reg[bounding_i[ireg_sat, 1][0] : bounding_i[ireg_sat, 1][1]]
-
-                width        = (l_reg_bound_right[0]-l_reg_bound_left[-1])
-                l_bounds_sat = [l_reg_bound_left[0], l_reg_bound_right[-1]]
-                l_reg_bounds = np.concatenate((l_reg_bound_left, l_reg_bound_right))
-                f_reg_bounds = np.concatenate((f_reg_bound_left, f_reg_bound_right))
-                n_reg_bounds = np.concatenate((n_reg_bound_left, n_reg_bound_right))
-
-                N_range = np.linspace(start=logN_bounds[0], stop=logN_bounds[1], num=20)
-                b_range = np.linspace(start=np.log10(b_bounds[0]), stop=np.log10(b_bounds[1]), num=20)
-                b_range = 10**b_range
-                i_middle    = int((regions_i_sat[ireg_sat, 0] + regions_i_sat[ireg_sat, 1]) / 2)
-                middle_guess = l_reg[i_middle]
-                bounds = np.array(np.array([logN_bounds]))
-                bounds = np.append(bounds, np.array([b_bounds]), axis=0)
-                bounds = np.append(bounds, np.array([l_bounds_sat]), axis=0)
-
-                chisq_best = 1.e20
-                chisq_soln = 1.e20
-                for Ncol in N_range:
-                    for bpar in b_range:
-                        params     = np.array([Ncol, bpar, middle_guess])
-                        chisq_soln = _chisq(params, l_reg_bounds, f_reg_bounds, n_reg_bounds, ion_name, mode)
-                        if chisq_soln < chisq_best:
-                            chisq_best = chisq_soln
-                            Nbest = Ncol
-                            bbest = bpar
-                params = np.array([Nbest, bbest, middle_guess])
-                if verbose:
-                    print("Found best-fit sat line (chisq=%g) with params"%(chisq_best), params)
-
-                if len(params_reg) == 0:
-                    params_reg = np.array(params)
-                else:
-                    params_reg = np.append(params_reg, np.array(params))
-
-                if len(bounds_reg) == 0:
-                    bounds_reg = np.array(bounds)
-                else:
-                    bounds_reg = np.append(bounds_reg, np.array(bounds))
-
-            if verbose:
-                print(
-                    "Saturated line gives full region %d (%g-%g): chisq= %g with %d lines"
-                    % (ireg, regions_l[ireg, 0], regions_l[ireg, 1],
-                       chisq_soln, int(len(params_reg) / 3))
-                )
-
-            params = np.reshape(params_reg, (int(len(params_reg) / 3), 3))
-            bounds = np.reshape(bounds_reg, (int(len(params_reg)), 2))
-            if chisq_soln > 10000:
-                params = []
-                bounds = []
-                print('ChiSquare is too big, probably no saturated region.')
-
-        else:
-            params      = []
-            bounds      = []
-            n_lines     = 0
-            best_nlines = 1
-            chisq_old   = 1.0e20
-            chisq_soln  = chisq_old
-            chisq_accept = abs(chisq_lim)
-            l_reg = l[regions_i[ireg, 0] : regions_i[ireg, 1]]
-            f_reg = flux[regions_i[ireg, 0] : regions_i[ireg, 1]]
-            n_reg = noise[regions_i[ireg, 0] : regions_i[ireg, 1]]
-
-        if len(params) != 0:
-            resid = (1.0 + f_reg - _tau_to_flux(model_tau_fast(ion_name, params.flatten(), l_reg, mode)))
-        else:
-            distance = int(len(l_reg)/20)
-            if distance < 1:
-                distance = 1
-
-        n_lines    = 0
-        chisq_best = 1.e20
-        chisq_old  = 1.e20
-        delta_l    = l_reg[1]-l_reg[0]
-        while n_lines < max_lines-1:
-            params, bounds = _add_line(ion_name, params, bounds, l_reg, f_reg, n_reg, l0, mode)
-            if params[-1] in params[2::3]:
-                params[-1] = params[-1] + delta_l * (0.5*np.random.rand() - 1)
-            n_lines    = int(len(params) / 3)
-            resid      = 1.0 + f_reg - _tau_to_flux(model_tau_fast(ion_name, params.flatten(), l_reg, mode))
-            chisq_soln = _chisq(params, l_reg, f_reg, n_reg, ion_name, mode)
-            if chisq_soln < chisq_best:
-                best_nlines  = n_lines
-                best_params  = params
-                best_bounds  = bounds
-                chisq_best   = chisq_soln
-            if chisq_soln < chisq_accept:
+                print("Region %d: %d lines, chisq_tot %.1f -> %.1f"
+                      % (ireg, len(trial) // 3, chi2_tot, chi2_trial))
+            if (chi2_tot - chi2_trial < _DCHISQ_PER_LINE
+                    or chi2_trial > chisq_factor * chi2_tot):
                 break
-            if chisq_soln > chisq_factor * chisq_old:
-                break
-            if params[-3] <= logN_bounds[0] and params[-2] <= b_bounds[0] and n_lines > 4:
-                params     = np.delete(params, [-3, -2, -1], axis=0)
-                bounds     = np.delete(bounds, [-3, -2, -1], axis=0)
-                n_lines    = int(len(params) / 3)
-                chisq_soln = _chisq(params, l_reg, f_reg, n_reg, ion_name, mode)
-                break
-            chisq_old = chisq_soln
-            if verbose:
-                print(f'Region {ireg}: Added line {n_lines-1} with N=%.4f, b=%.4f, l=%.4f, chisq=%.3f' % (params[-3],params[-2],params[-1],chisq_soln))
+            params, chi2_tot = trial, chi2_trial
+
+        params = _prune(params, l_reg, f_reg, n_reg, "Region %d" % ireg)
         if verbose:
-            print(f'Region {ireg}: Found {n_lines} lines in first guess, chisq=%.3f'%chisq_soln)
+            print("Region %d: FINAL FIT %d lines, N=%s, chisq=%.3f"
+                  % (ireg, len(params) // 3, np.round(params[0::3], 3),
+                     _chisq(params, l_reg, f_reg, n_reg, ion_name, mode)))
+        params_all = np.append(params_all, params)
+        region_of  = np.append(region_of, np.full(len(params) // 3, ireg))
 
-        best_nlines = n_lines
-        best_params = params
-        best_bounds = bounds
-        chisq_best  = chisq_soln
-        first_time  = True
-        while n_lines < max_lines and chisq_soln > chisq_accept:
-            if not first_time:
-                params, bounds = _add_line(ion_name, params, bounds, l_reg, f_reg, n_reg, l0, mode)
-                n_lines = int(len(params) / 3)
-            constraint = NonlinearConstraint(
-                fun=_model_flux,
-                lb=f_reg - N_sigma_constr * n_reg,
-                ub=np.inf,
-                jac=_constraint_jac,
-            )
-            soln = minimize(
-                _chisq,
-                params,
-                bounds=bounds,
-                args=(l_reg, f_reg, n_reg, ion_name, mode),
-                method="trust-constr",
-                constraints=constraint,
-                options={"maxiter": _maxiter(n_lines, max_lines), "gtol": 1e-8},
-            )
-            params     = soln.x
-            chisq_soln = _chisq(params, l_reg, f_reg, n_reg, ion_name, mode)
-            if verbose and not first_time:
-                print("Region %d: Added new line %d (N=%g), after %d iters, chisq=%.3f"
-                      % (ireg, n_lines, params[-3], soln.nit, chisq_soln))
-            first_time = False
-            if chisq_soln < chisq_factor * chisq_best:
-                best_nlines = n_lines
-                best_params = params
-                best_bounds = bounds
-                chisq_best  = chisq_soln
-            elif n_lines <= 2 and chisq_soln < chisq_best:
-                best_nlines = n_lines
-                best_params = params
-                best_bounds = bounds
-                chisq_best  = chisq_soln
-                continue
-            else:
-                params     = best_params
-                bounds     = best_bounds
-                n_lines    = int(len(params) / 3)
-                chisq_soln = chisq_best
-                break
+    # ── Full spectrum: joint fit of all components (overlapping wings of
+    # neighbouring regions), dropping any that became insignificant ─────────
 
-        compute_errors = True
-        delta_params   = [0.02, 0.05, 0.0001] * n_lines
-        if compute_errors:
-            params_jiggled = params + delta_params * (2 * np.random.rand(len(params)) - 1)
-            soln = minimize(
-                _chisq,
-                params_jiggled,
-                args=(l_reg, f_reg, n_reg, ion_name, mode),
-                method="BFGS",
-                options={"maxiter": 100},
-            )
-            cov = soln.hess_inv
-
-        while n_lines > 1:
-            for i in range(n_lines):
-                trial_params = params.copy()
-                i_del        = 3*i
-                trial_params = np.delete(trial_params, [i_del, i_del+1, i_del+2], axis=0)
-                chisq_trial  = _chisq(trial_params, l_reg, f_reg, n_reg, ion_name, mode)
-                delta_chisq  = abs(chisq_trial-chisq_best)/chisq_trial
-                if delta_chisq < 0.01 or chisq_trial < chisq_accept:
-                    if verbose:
-                        print("Region %d: Removed line %d (N=%g): chisq=%g, chisq_old=%g"
-                              %(ireg, i_del/3, params[3*i], chisq_trial, chisq_best))
-                    params     = trial_params.copy()
-                    bounds     = np.delete(bounds, [i_del, i_del+1, i_del+2], axis=0)
-                    chisq_best = chisq_trial
-                    n_lines    = int(len(params)/3)
-                    break
-                else:
-                    continue
-            if i >= n_lines-2:
-                break
-
-        while n_lines > 1:
-            for i in range(n_lines-1):
-                trial_params = params.copy()
-                ip  = 3*i
-                ip1 = 3*(i+1)
-                N_i  = 10**params[ip]
-                N_i1 = 10**params[ip1]
-                trial_params[ip]   = np.log10(N_i + N_i1)
-                trial_params[ip+1] = (N_i * params[ip+1] + N_i1 * params[ip+4]) / (N_i + N_i1)
-                trial_params[ip+2] = (N_i * params[ip+2] + N_i1 * params[ip+5]) / (N_i + N_i1)
-                trial_params       = np.delete(trial_params, [ip+3, ip+4, ip+5], axis=0)
-                chisq_trial  = _chisq(trial_params, l_reg, f_reg, n_reg, ion_name, mode)
-                delta_chisq  = abs(chisq_trial-chisq_best)/chisq_trial
-                if delta_chisq < 0.01 or chisq_trial < chisq_accept:
-                    if verbose:
-                        print("Region %d: Combining lines %d and %d (N=%g and %g): chisq=%g, chisq_old=%g"
-                              %(ireg, i, i+1, N_i, N_i1, chisq_trial, chisq_best))
-                    params     = trial_params.copy()
-                    bounds     = np.delete(bounds, [ip+3, ip+4, ip+5], axis=0)
-                    chisq_best = chisq_trial
-                    n_lines    = int(len(params)/3)
-                    break
-                else:
-                    continue
-            if i >= n_lines-2:
-                break
-
-        chisq_soln = _chisq(params, l_reg, f_reg, n_reg, ion_name, mode)
-        for ip in np.arange(n_lines):
-            line_list["region"] = np.append(line_list["region"], ireg)
-            line_list["N"]      = np.append(line_list["N"],  params[ip * 3])
-            line_list["b"]      = np.append(line_list["b"],  params[ip * 3 + 1])
-            line_list["l"]      = np.append(line_list["l"],  params[ip * 3 + 2])
-            line_list["dN"]     = np.append(line_list["dN"], np.sqrt(cov[ip * 3, ip * 3]))
-            line_list["db"]     = np.append(line_list["db"], np.sqrt(cov[ip * 3 + 1, ip * 3 + 1]))
-            line_list["dl"]     = np.append(line_list["dl"], np.sqrt(cov[ip * 3 + 2, ip * 3 + 2]))
-            tau_line = model_tau_fast(
-                ion_name,
-                [params[ip * 3], params[ip * 3 + 1], params[ip * 3 + 2]],
-                l_reg, mode,
-            )
-            line_list["EW"]    = np.append(line_list["EW"],    EquivalentWidth(_tau_to_flux(tau_line), l_reg))
-            line_list["Chisq"] = np.append(line_list["Chisq"], chisq_soln)
-
-        if verbose:
-            print(f"Region {ireg}: FINAL FIT {n_lines} lines, N={params[0::3]}, chisq=%.3f"%(chisq_soln))
-            if chisq_soln > chisq_accept:
-                print("Region %d: WARNING large chisq=%.3f > %.3f; check fit"
-                      % (ireg, chisq_soln, chisq_accept))
-
-    # ── Full-spectrum refinement: remove, combine, and reduce lines ───────
-
-    n_lines = len(line_list["N"])
-    while n_lines > 1:
-        params = []
-        for ip in range(n_lines):
-            params.append(line_list["N"][ip])
-            params.append(line_list["b"][ip])
-            params.append(line_list["l"][ip])
-        params     = np.array(params)
-        chisq_soln = _chisq(params, l, flux, noise, ion_name, mode)
-
-        for i in range(n_lines):
-            trial_params = params.copy()
-            i_del        = 3*i
-            trial_params = np.delete(trial_params, [i_del, i_del+1, i_del+2], axis=0)
-            chisq_trial  = _chisq(trial_params, l, flux, noise, ion_name, mode)
-            if chisq_trial < 1.001 * chisq_soln:
-                line_list  = {k: np.delete(v, i) for k, v in line_list.items()}
-                chisq_soln = chisq_trial
-                n_lines    = len(line_list["N"])
-                if verbose:
-                    print("Full spectrum: Removed line %d (N=%g), %d left: chisq=%g, chisq_old=%g"
-                          %(i_del, params[3*i], n_lines, chisq_trial, chisq_soln))
-                break
-            else:
-                continue
-        if i >= n_lines-2:
-            break
-
-    n_lines = len(line_list["N"])
-    while n_lines > 1:
-        params = []
-        for ip in range(n_lines):
-            params.append(line_list["N"][ip])
-            params.append(line_list["b"][ip])
-            params.append(line_list["l"][ip])
-        params     = np.array(params)
-        chisq_soln = _chisq(params, l, flux, noise, ion_name, mode)
-
-        for i in range(n_lines-1):
-            trial_params = params.copy()
-            ip  = 3*i
-            ip1 = 3*(i+1)
-            N_i  = 10**params[ip]
-            N_i1 = 10**params[ip1]
-            trial_params[ip]   = np.log10(N_i + N_i1)
-            trial_params[ip+1] = (N_i * params[ip+1] + N_i1 * params[ip+4]) / (N_i + N_i1)
-            trial_params[ip+2] = (N_i * params[ip+2] + N_i1 * params[ip+5]) / (N_i + N_i1)
-            trial_params       = np.delete(trial_params, [ip+3, ip+4, ip+5], axis=0)
-            chisq_trial  = _chisq(trial_params, l, flux, noise, ion_name, mode)
-            if chisq_trial < 1.001 * chisq_soln:
-                if verbose:
-                    print("Full spectrum: Combined lines %d and %d (N=%g and %g): chisq=%g, chisq_old=%g"
-                          %(i, i+1, N_i, N_i1, chisq_trial, chisq_soln))
-                line_list["N"][i] = trial_params[ip]
-                line_list["b"][i] = trial_params[ip+1]
-                line_list["l"][i] = trial_params[ip+2]
-                line_list  = {k: np.delete(v, i+1) for k, v in line_list.items()}
-                n_lines    = len(line_list["N"])
-                params = trial_params.copy()
-                chisq_soln = chisq_trial
-                break
-            else:
-                continue
-        if i >= n_lines-2:
-            break
-
-    # ── Final pass: optimise column densities only, b and λ fixed ────────────
-    # With line positions and widths fixed this is an n_lines-dimensional
-    # problem (vs. 3·n_lines for the full fit), so it converges very quickly.
-    # Pre-computing the unit tau profiles (N=1 per line) via the lookup table
-    # means each chi-sq evaluation costs only a dot-product + exp() — no
-    # model_tau or lookup-table interpolation needed inside the optimizer loop.
-    # This step subsumes the iterative f_reduce=0.999 column-reduction loop.
-    n_lines_final = len(line_list["N"])
-
-    if n_lines_final > 0:
-        b_fixed   = line_list["b"].copy()
-        l_fixed   = line_list["l"].copy()
-        logN_init = line_list["N"].copy()
-        l_arr     = np.asarray(l,     dtype=float)
-        flux_arr  = np.asarray(flux,  dtype=float)
-        noise_arr = np.asarray(noise, dtype=float)
-
-        # Pre-compute unit optical-depth profile for each line via lookup table.
-        # logN=0 → N = 10⁰ = 1 cm⁻², so compute_tau returns τ_unit directly.
-        # Shape: (n_lines_final, n_pixels).  Only needs to be done once since
-        # b and λ₀ are fixed throughout this optimisation.
-        tau_units = np.array([
-            _lookup.compute_tau(0.0, float(b_fixed[ip]), float(l_fixed[ip]), l_arr)
-            for ip in range(n_lines_final)
-        ])  # shape (n_lines_final, n_pixels)
-
-        def _chisq_N_only(logN_vals):
-            """
-            Reduced chi-squared as a function of column densities alone.
-
-            b and λ₀ are captured from the enclosing scope and held fixed.
-            Cost per call: one (n_lines × n_pixels) dot-product + one exp().
-            No model_tau or lookup-table queries inside the optimizer loop.
-
-            Args:
-                logN_vals (numpy array): log₁₀ column densities, length n_lines.
-
-            Returns:
-                chisq (float): Reduced chi-squared over the full spectrum.
-            """
-            tau_total  = np.dot(10.0 ** logN_vals, tau_units)   # (n_pixels,)
-            model_flux = np.exp(-np.clip(tau_total, -50.0, 50.0))
-            dx         = (flux_arr - model_flux) / noise_arr
-            nz         = np.count_nonzero(dx)
-            return np.sum(dx * dx) / nz if nz > 0 else 1.e20
-
-        chisq_before = _chisq_N_only(logN_init)
-
-        soln_N = minimize(
-            _chisq_N_only,
-            logN_init,
-            bounds=[logN_bounds] * n_lines_final,   # one [min, max] per line
-            #method="L-BFGS-B",                      # handles bounds, no constraints needed
-            #options={"maxiter": 200, "ftol": 1e-14, "gtol": 1e-9},
-            method="Powell",                      # handles bounds, no constraints needed
-            options={"maxiter": 200}, 
-        )
-
-        if soln_N.fun < chisq_before:
-            line_list["N"] = soln_N.x
-            chisq_soln = soln_N.fun
+    perr_all = np.zeros_like(params_all)
+    if len(params_all) > 0:
+        params_all, perr_all = _fit(params_all, l, flux, noise)
+        chi2 = _chisq_tot(params_all, l, flux, noise)
+        keep = np.ones(len(params_all) // 3, dtype=bool)
+        for i in np.argsort(params_all[0::3]):
+            trial = params_all.reshape(-1, 3)[keep & (np.arange(len(keep)) != i)].ravel()
+            if _chisq_tot(trial, l, flux, noise) - chi2 < _DCHISQ_PER_LINE:
+                keep[i] = False
+        if not keep.all():
             if verbose:
-                delta = chisq_before - chisq_soln
-                print(
-                    f"Final N-only minimization: chisq {chisq_before:.4f} → "
-                    f"{soln_N.fun:.4f}  (Δ = {delta:.4f})  "
-                    f"after {soln_N.nit} iterations"
-                )
-                #print(f"  Optimised logN: {soln_N.x}")
-        else:
-            if verbose:
-                print(
-                    f"Final N-only minimization did not improve chisq "
-                    f"({chisq_before:.4f} → {soln_N.fun:.4f}); "
-                    f"keeping original N values."
-                )
+                print("Full spectrum: removed %d insignificant line(s)" % np.sum(~keep))
+            params_all = params_all.reshape(-1, 3)[keep].ravel()
+            region_of  = region_of[keep]
+            params_all, perr_all = _fit(params_all, l, flux, noise)
+
+    model_flux = _tau_to_flux(model_tau_fast(ion_name, params_all, l, mode, lookup=_lookup))
+    for ip in range(len(params_all) // 3):
+        ireg = region_of[ip]
+        sl = slice(regions_i[ireg, 0], regions_i[ireg, 1])
+        dx = (flux[sl] - model_flux[sl]) / noise[sl]
+        tau_line = model_tau_fast(ion_name, params_all[3*ip:3*ip+3], l[sl], mode, lookup=_lookup)
+        line_list["region"] = np.append(line_list["region"], ireg)
+        line_list["N"]      = np.append(line_list["N"],  params_all[3*ip])
+        line_list["b"]      = np.append(line_list["b"],  params_all[3*ip+1])
+        line_list["l"]      = np.append(line_list["l"],  params_all[3*ip+2])
+        line_list["dN"]     = np.append(line_list["dN"], perr_all[3*ip])
+        line_list["db"]     = np.append(line_list["db"], perr_all[3*ip+1])
+        line_list["dl"]     = np.append(line_list["dl"], perr_all[3*ip+2])
+        line_list["EW"]     = np.append(line_list["EW"], EquivalentWidth(_tau_to_flux(tau_line), l[sl]))
+        line_list["Chisq"]  = np.append(line_list["Chisq"], np.sum(dx * dx) / max(np.count_nonzero(dx), 1))
 
     if verbose:
-        print(f"Full spectrum: FINAL FIT {n_lines} lines in %d regions, chisq=%.3f. Line list [i,N,b,l]:"
-              %(len(regions_l), chisq_soln))
-        for ip in range(n_lines):
+        print("Full spectrum: FINAL FIT %d lines in %d regions, chisq=%.3f. Line list [i,N,b,l]:"
+              % (len(line_list["N"]), len(regions_l), _chisq(params_all, l, flux, noise, ion_name, mode)))
+        for ip in range(len(line_list["N"])):
             print(ip, line_list["N"][ip], line_list["b"][ip], line_list["l"][ip])
 
     return line_list
+
+
+# Minimum decrease of the total χ² for an additional component (3 parameters)
+# to be kept: the Akaike information criterion, 2 per free parameter.
+_DCHISQ_PER_LINE = 6.0
+
+
+def _lsq_fit_lines(lookup, p, l, flux, noise, logN_bounds, b_bounds):
+    """
+    Least-squares fit of all components in p to the flux.
+
+    The line centres are fitted as velocity offsets (km/s) from the middle of
+    the wavelength grid, so all parameters are of similar scale, and the
+    Jacobian is computed per component from the lookup table (analytic in
+    logN, central differences in b and v).
+
+    Args:
+        lookup (TauLookupTable): Table for the line and profile shape.
+        p (array-like):          Flat start parameters [logN, b, λ₀, …].
+        l (numpy array):         Wavelengths (Å).
+        flux (numpy array):      Normalised flux.
+        noise (numpy array):     1-sigma noise (> 0).
+        logN_bounds (list):      [min, max] log₁₀ column density.
+        b_bounds (list):         [min, max] Doppler parameter (km/s).
+
+    Returns:
+        p (numpy array):    Best-fit [logN, b, λ₀, …]; centres within l.
+        perr (numpy array): 1-sigma errors from the Jacobian at the solution.
+    """
+    c_kms = lookup.c_kms
+    p = np.asarray(p, dtype=float).reshape(-1, 3)
+    n = len(p)
+    if n == 0:
+        return np.array([]), np.array([])
+    l_ref = 0.5 * (l[0] + l[-1])
+    lo = np.tile([logN_bounds[0], b_bounds[0], (l[0] / l_ref - 1.0) * c_kms], n)
+    hi = np.tile([logN_bounds[1], b_bounds[1], (l[-1] / l_ref - 1.0) * c_kms], n)
+    x0 = np.column_stack([p[:, 0], p[:, 1], (p[:, 2] / l_ref - 1.0) * c_kms]).ravel()
+    pad = 1e-6 * (hi - lo)
+    x0 = np.clip(x0, lo + pad, hi - pad)
+    h_v = lookup.dv
+
+    def _tau_one(logN, b, v):
+        return lookup.compute_tau(logN, b, l_ref * (1.0 + v / c_kms), l)
+
+    def _taus(x):
+        return np.array([_tau_one(*x[3*i:3*i+3]) for i in range(n)])
+
+    def _resid(x):
+        tau = np.sum(_taus(x), axis=0)
+        return (flux - np.exp(-np.clip(tau, -50, 50))) / noise
+
+    def _jac(x):
+        taus = _taus(x)
+        F_sig = np.exp(-np.clip(np.sum(taus, axis=0), -50, 50)) / noise
+        J = np.empty((len(l), 3 * n))
+        for i in range(n):
+            logN, b, v = x[3*i:3*i+3]
+            h_b = 0.01 * b
+            J[:, 3*i]   = F_sig * np.log(10.0) * taus[i]
+            J[:, 3*i+1] = F_sig * (_tau_one(logN, b + h_b, v) - _tau_one(logN, b - h_b, v)) / (2 * h_b)
+            J[:, 3*i+2] = F_sig * (_tau_one(logN, b, v + h_v) - _tau_one(logN, b, v - h_v)) / (2 * h_v)
+        return J
+
+    soln = least_squares(_resid, x0, jac=_jac, bounds=(lo, hi), method="trf",
+                         x_scale="jac")
+    x = soln.x
+    try:
+        perr = np.sqrt(np.abs(np.diag(np.linalg.pinv(soln.jac.T @ soln.jac))))
+    except np.linalg.LinAlgError:
+        perr = np.full(len(x), np.nan)
+    p_fit = x.reshape(-1, 3).copy()
+    p_fit[:, 2] = l_ref * (1.0 + p_fit[:, 2] / c_kms)
+    perr = perr.reshape(-1, 3)
+    perr[:, 2] *= l_ref / c_kms
+    return p_fit.ravel(), perr.ravel()
 
 
 def find_regions(

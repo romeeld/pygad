@@ -601,12 +601,10 @@ class Spectrum(object):
             vel_range (float):           Half-width of the velocity window (km/s).
             do_continuum_buffer (bool):  Pad each end with nbuffer continuum pixels.
             nbuffer (int):               Number of continuum buffer pixels per end.
-            chisq_lim (float):           Reduced χ² acceptance threshold; no more
-                                         lines are added once χ² falls below this.
+            chisq_lim (float):           Not used any more; see fit_profiles_sat().
             chisq_factor (float):        A new line is accepted only when it reduces
                                          χ² by at least this factor (must be ≤ 1).
-            N_sigma_constr (float):      The model flux is constrained to exceed
-                                         flux − N_sigma_constr × noise at every pixel.
+            N_sigma_constr (float):      Not used any more; see fit_profiles_sat().
             max_lines (int):             Maximum Voigt components allowed per region.
             mode (str):                  Profile shape ('Voigt', 'Gaussian' or
                                          'Lorentzian'); sets self.mode.  Defaults
@@ -765,8 +763,13 @@ def fit_profiles_sat(
     if isinstance(l, np.ndarray) or l.units in [1, None]:
         l = UnitArr(l, "Angstrom")
     l     = np.asarray(l,     dtype=float)
-    flux  = np.asarray(flux,  dtype=float)
-    noise = np.asarray(noise, dtype=float)
+    flux  = np.asarray(flux,  dtype=float).copy()
+    noise = np.asarray(noise, dtype=float).copy()
+    # pixels without a usable flux or noise do not constrain the fit
+    bad = ~(np.isfinite(flux) & np.isfinite(noise) & (noise > 0))
+    flux[bad], noise[bad] = 1.0, 1e30
+    # the lookup table clamps b to its range, where the model is flat in b
+    b_bounds = [max(b_bounds[0], _lookup.b_min), min(b_bounds[1], _lookup.b_max)]
 
     # ── Inner helper functions ────────────────────────────────────────────
 
@@ -903,9 +906,10 @@ def fit_profiles_sat(
         new = [logN - 0.3, 0.7 * b, l_c - dl, logN - 0.3, 0.7 * b, l_c + dl]
         return np.append(np.delete(p, [3*i, 3*i+1, 3*i+2]), new)
 
-    def _fit(p, l, flux, noise):
+    def _fit(p, l, flux, noise, l_bounds=None):
         """Least-squares fit of all components in p; see _lsq_fit_lines()."""
-        return _lsq_fit_lines(_lookup, p, l, flux, noise, logN_bounds, b_bounds)
+        return _lsq_fit_lines(_lookup, p, l, flux, noise, logN_bounds, b_bounds,
+                              l_bounds=l_bounds)
 
     def _chisq_tot(p, l, flux, noise):
         """Total (not reduced) χ² of the model p."""
@@ -991,6 +995,8 @@ def fit_profiles_sat(
                 chi2_cand = _chisq_tot(cand, l_reg, f_reg, n_reg)
                 if chi2_cand < chi2_trial:
                     trial, chi2_trial = cand, chi2_cand
+            if trial is None:
+                break
             if verbose:
                 print("Region %d: %d lines, chisq_tot %.1f -> %.1f"
                       % (ireg, len(trial) // 3, chi2_tot, chi2_trial))
@@ -1010,9 +1016,14 @@ def fit_profiles_sat(
     # ── Full spectrum: joint fit of all components (overlapping wings of
     # neighbouring regions), dropping any that became insignificant ─────────
 
+    def _region_bounds(region_of):
+        # each centre stays within its region, so region, EW and Chisq of the
+        # line list refer to where the line is
+        return np.array([regions_l[ireg] for ireg in region_of], dtype=float)
+
     perr_all = np.zeros_like(params_all)
     if len(params_all) > 0:
-        params_all, perr_all = _fit(params_all, l, flux, noise)
+        params_all, perr_all = _fit(params_all, l, flux, noise, _region_bounds(region_of))
         chi2 = _chisq_tot(params_all, l, flux, noise)
         keep = np.ones(len(params_all) // 3, dtype=bool)
         for i in np.argsort(params_all[0::3]):
@@ -1024,7 +1035,7 @@ def fit_profiles_sat(
                 print("Full spectrum: removed %d insignificant line(s)" % np.sum(~keep))
             params_all = params_all.reshape(-1, 3)[keep].ravel()
             region_of  = region_of[keep]
-            params_all, perr_all = _fit(params_all, l, flux, noise)
+            params_all, perr_all = _fit(params_all, l, flux, noise, _region_bounds(region_of))
 
     model_flux = _tau_to_flux(model_tau_fast(ion_name, params_all, l, mode, lookup=_lookup))
     for ip in range(len(params_all) // 3):
@@ -1056,7 +1067,7 @@ def fit_profiles_sat(
 _DCHISQ_PER_LINE = 6.0
 
 
-def _lsq_fit_lines(lookup, p, l, flux, noise, logN_bounds, b_bounds):
+def _lsq_fit_lines(lookup, p, l, flux, noise, logN_bounds, b_bounds, l_bounds=None):
     """
     Least-squares fit of all components in p to the flux.
 
@@ -1073,10 +1084,13 @@ def _lsq_fit_lines(lookup, p, l, flux, noise, logN_bounds, b_bounds):
         noise (numpy array):     1-sigma noise (> 0).
         logN_bounds (list):      [min, max] log₁₀ column density.
         b_bounds (list):         [min, max] Doppler parameter (km/s).
+        l_bounds (array-like):   Optional (n_lines, 2) [min, max] wavelengths
+                                 of each centre (Å); default: the range of l.
 
     Returns:
-        p (numpy array):    Best-fit [logN, b, λ₀, …]; centres within l.
-        perr (numpy array): 1-sigma errors from the Jacobian at the solution.
+        p (numpy array):    Best-fit [logN, b, λ₀, …].
+        perr (numpy array): 1-sigma errors from the Jacobian at the solution;
+                            inf for parameters the data do not constrain.
     """
     c_kms = lookup.c_kms
     p = np.asarray(p, dtype=float).reshape(-1, 3)
@@ -1084,8 +1098,11 @@ def _lsq_fit_lines(lookup, p, l, flux, noise, logN_bounds, b_bounds):
     if n == 0:
         return np.array([]), np.array([])
     l_ref = 0.5 * (l[0] + l[-1])
-    lo = np.tile([logN_bounds[0], b_bounds[0], (l[0] / l_ref - 1.0) * c_kms], n)
-    hi = np.tile([logN_bounds[1], b_bounds[1], (l[-1] / l_ref - 1.0) * c_kms], n)
+    if l_bounds is None:
+        l_bounds = np.tile([l[0], l[-1]], (n, 1))
+    v_bounds = (np.asarray(l_bounds, dtype=float) / l_ref - 1.0) * c_kms
+    lo = np.column_stack([np.full(n, logN_bounds[0]), np.full(n, b_bounds[0]), v_bounds[:, 0]]).ravel()
+    hi = np.column_stack([np.full(n, logN_bounds[1]), np.full(n, b_bounds[1]), v_bounds[:, 1]]).ravel()
     x0 = np.column_stack([p[:, 0], p[:, 1], (p[:, 2] / l_ref - 1.0) * c_kms]).ravel()
     pad = 1e-6 * (hi - lo)
     x0 = np.clip(x0, lo + pad, hi - pad)
@@ -1107,24 +1124,43 @@ def _lsq_fit_lines(lookup, p, l, flux, noise, logN_bounds, b_bounds):
         J = np.empty((len(l), 3 * n))
         for i in range(n):
             logN, b, v = x[3*i:3*i+3]
-            h_b = 0.01 * b
+            # central difference in b, kept inside the table's b range
+            b_lo = max(0.99 * b, lookup.b_min)
+            b_hi = min(1.01 * b, lookup.b_max)
             J[:, 3*i]   = F_sig * np.log(10.0) * taus[i]
-            J[:, 3*i+1] = F_sig * (_tau_one(logN, b + h_b, v) - _tau_one(logN, b - h_b, v)) / (2 * h_b)
+            J[:, 3*i+1] = F_sig * (_tau_one(logN, b_hi, v) - _tau_one(logN, b_lo, v)) / (b_hi - b_lo)
             J[:, 3*i+2] = F_sig * (_tau_one(logN, b, v + h_v) - _tau_one(logN, b, v - h_v)) / (2 * h_v)
         return J
 
     soln = least_squares(_resid, x0, jac=_jac, bounds=(lo, hi), method="trf",
                          x_scale="jac")
     x = soln.x
-    try:
-        perr = np.sqrt(np.abs(np.diag(np.linalg.pinv(soln.jac.T @ soln.jac))))
-    except np.linalg.LinAlgError:
-        perr = np.full(len(x), np.nan)
+    perr = _lsq_errors(soln.jac)
     p_fit = x.reshape(-1, 3).copy()
     p_fit[:, 2] = l_ref * (1.0 + p_fit[:, 2] / c_kms)
     perr = perr.reshape(-1, 3)
     perr[:, 2] *= l_ref / c_kms
     return p_fit.ravel(), perr.ravel()
+
+
+def _lsq_errors(J):
+    """
+    1-sigma parameter errors sqrt(diag((JᵀJ)⁻¹)) from the Jacobian of the
+    noise-weighted residuals, via its SVD.  Directions with (numerically)
+    vanishing singular values are unconstrained, and every parameter with a
+    share in them gets an infinite error.
+    """
+    try:
+        _, s, Vt = np.linalg.svd(J, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return np.full(J.shape[1], np.nan)
+    if len(s) == 0 or s[0] == 0:
+        return np.full(J.shape[1], np.inf)
+    ok = s > np.finfo(float).eps * max(J.shape) * s[0]
+    var = np.sum((Vt[ok] / s[ok, None]) ** 2, axis=0)
+    if not ok.all():
+        var[np.any(np.abs(Vt[~ok]) > 1e-6, axis=0)] = np.inf
+    return np.sqrt(var)
 
 
 def find_regions(
@@ -1720,14 +1756,11 @@ def fit_profiles(
         vel_range (float):        Half-width of the velocity window around the
                                   galaxy to fit (km/s).  Set to 0 (default) to
                                   fit the entire spectrum.
-        chisq_lim (float):        Reduced χ² acceptance threshold; fitting stops
-                                  adding lines once χ² < chisq_lim.
+        chisq_lim (float):        Not used any more; see fit_profiles_sat().
         chisq_factor (float):     A new line is accepted only when it reduces χ²
                                   by at least this factor (must be ≤ 1).
         max_lines (int):          Maximum Voigt components per absorption region.
-        N_sigma_constr (float):   The constrained minimiser requires the model
-                                  flux to exceed flux − N_sigma_constr × noise
-                                  at every pixel.
+        N_sigma_constr (float):   Not used any more; see fit_profiles_sat().
         mode (str):               Profile shape: 'Voigt' (default), 'Gaussian',
                                   or 'Lorentzian'.
         logN_bounds (list):       [min, max] log₁₀ column density (cm⁻²) allowed

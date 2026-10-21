@@ -4,8 +4,8 @@ Benchmark pygad.analysis.vpfit.fit_profiles_sat on synthetic spectra with
 known components (single lines from unsaturated to strongly saturated, and
 blends), to measure biases in the recovered logN, b and line centres.
 
-Each case is a noisy spectrum of +-600 km/s, fitted with the same settings
-as scripts/random_los_spectra.py.  Every true component is matched to the
+Each case is a noisy spectrum of +-600 km/s (exact Voigt profiles), fitted
+with the same settings as scripts/random_los_spectra.py.  Every true component is matched to the
 nearest fitted component; extra fitted components with logN > 12.5 are
 counted as spurious.
 
@@ -56,7 +56,8 @@ def run_case(job):
     v = np.arange(-VMAX, VMAX, DV)
     l = lc * (1.0 + v / C_KMS)
     p_true = np.ravel([[N, b, lc * (1.0 + vc / C_KMS)] for N, b, vc in comps])
-    tau = model_tau_fast(line, p_true, l, "Voigt")
+    # exact profiles, not the fitter's lookup table, so its errors show up
+    tau = vpfit.model_tau(line, p_true, l, "Voigt")
     rng = np.random.default_rng(seed)
     noise = np.full_like(v, 1.0 / SNR)
     flux = np.exp(-tau) + rng.normal(0.0, 1.0 / SNR, len(v))

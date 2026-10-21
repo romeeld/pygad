@@ -114,6 +114,33 @@ def check_fix6():
     plt.close(fig)
 
 
+def check_fix7():
+    # fit_profiles_sat (least-squares core): a NaN flux or zero-noise pixel
+    # must not abort the fit; b stays within the tau lookup table's range;
+    # unconstrained parameters get infinite, not zero, errors.
+    import numpy as np
+
+    from pygad.analysis import vpfit
+    from pygad.analysis.tau_lookup import get_tau_lookup
+    lc = 1548.195 * 3.0
+    v = np.arange(-300., 300., 2.5)
+    l = lc * (1. + v / 299792.458)
+    rng = np.random.default_rng(1)
+    flux = np.exp(-vpfit.model_tau('CIV1548', [13.5, 8., lc], l))
+    flux += rng.normal(0., 0.02, len(v))
+    noise = np.full(len(v), 0.02)
+    rl, ri = vpfit.find_regions(l, flux, noise, N_sigma=10.0)
+    flux[118], noise[122] = np.nan, 0.     # within the absorption
+    ll = vpfit.fit_profiles_sat('CIV1548', l, flux, noise, rl, ri,
+                                logN_bounds=[10., 17.], b_bounds=[0.5, 150.])
+    i = np.argmax(ll['N'])
+    assert abs(ll['N'][i] - 13.5) < 0.1 and abs(ll['b'][i] - 8.) < 1.5, ll
+    assert np.min(ll['b']) >= get_tau_lookup('CIV1548', 'Voigt').b_min
+    J = np.array([[1., 0.], [2., 0.], [3., 0.]])     # 2nd parameter has no effect
+    err = vpfit._lsq_errors(J)
+    assert np.isfinite(err[0]) and np.isinf(err[1]), err
+
+
 def check_sanity():
     # Sanity: a unitful multiplication still yields a UnitArr with units.
     r = UnitArr([2., 4.], 'm') * UnitArr([2., 4.], 's')
@@ -130,5 +157,6 @@ if __name__ == '__main__':
     check_fix4()
     check_fix5()
     check_fix6()
+    check_fix7()
     check_sanity()
     print("all regression checks passed")

@@ -74,6 +74,46 @@ def check_fix4():
     assert np.array_equal(f1, f2), "repeated lookups differ"
 
 
+def check_fix5():
+    # mock_absorption_spectrum_of decided between one and several LOS with
+    # len(los) == 2, so exactly two LOS were treated as a single (x,y) position.
+    import numpy as np
+
+    from pygad.analysis import mock_absorption_spectrum_of
+    from pygad.units import UnitArr as UA
+    s = Snapshot(os.path.join(pygad.environment.module_dir,
+                              'snaps', 'snap_M1196_4x_320'), physical=False)
+    los = UA([[34700., 35600.], [34800., 35700.]], 'ckpc h_0**-1')
+    vel_extent = UA([2000., 3500.], 'km/s')
+    taus = mock_absorption_spectrum_of(s.gas, los, 'H1215', vel_extent,
+                                       Nbins=100)[0]
+    assert np.shape(taus) == (2, 100), "two LOS gave shape %s" % (np.shape(taus),)
+    tau0 = mock_absorption_spectrum_of(s.gas, los[0], 'H1215', vel_extent,
+                                       Nbins=100)[0]
+    assert np.shape(tau0) == (100,)
+    assert np.allclose(taus[0], tau0), "multi-LOS spectrum differs from single"
+
+
+def check_fix6():
+    # Spectrum.plot_fit called plt.show()/plt.close() even when drawing into
+    # the caller's axes, closing the caller's figure.
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    from pygad.analysis.vpfit import Spectrum
+    vel = np.linspace(0., 500., 201)
+    spec = Spectrum('H1215', 2.0, None, np.ones_like(vel),
+                    np.full_like(vel, 0.02), vel)
+    spec.line_list = {'N': np.array([13.5]), 'b': np.array([25.]),
+                      'l': np.array([spec.wavelengths[100]])}
+    fig, ax = plt.subplots()
+    assert spec.plot_fit(ax=ax) is ax
+    assert plt.fignum_exists(fig.number), "plot_fit closed the caller's figure"
+    plt.close(fig)
+
+
 def check_sanity():
     # Sanity: a unitful multiplication still yields a UnitArr with units.
     r = UnitArr([2., 4.], 'm') * UnitArr([2., 4.], 's')
@@ -88,5 +128,7 @@ if __name__ == '__main__':
     check_fix3b()
     check_fix3c()
     check_fix4()
+    check_fix5()
+    check_fix6()
     check_sanity()
     print("all regression checks passed")

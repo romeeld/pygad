@@ -583,7 +583,9 @@ def mock_absorption_spectrum_of(s, los, line, vel_extent, **kwargs):
             "unkown line '%s' -- " % line
             + "see `analysis.absorption_spectra.lines.keys()`"
         )
-    if len(los) == 2:
+    # a single LOS is one (x,y) position; several are an (N,2) array
+    # (checking len(los)==2 would mistake exactly two LOS for a single one)
+    if np.ndim(los) == 1:
         return mock_absorption_spectrum(
             s,
             los,
@@ -597,7 +599,6 @@ def mock_absorption_spectrum_of(s, los, line, vel_extent, **kwargs):
             **kwargs
         )
     else:
-        print("multiple LOS, number of LOS is ", len(los))
         return mock_absorption_spectra_multilos(
             s,
             los,

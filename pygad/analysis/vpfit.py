@@ -261,7 +261,8 @@ class Spectrum(object):
         self.continuum = np.ones(len(self.wavelengths))
         self.verbose = (environment.verbose > environment.VERBOSE_QUIET)
         if self.verbose:
-            print('N,b bounds:', self.logN_bounds, self.b_bounds)
+            print('N,b bounds:', getattr(self, 'logN_bounds', None),
+                  getattr(self, 'b_bounds', None))
 
     def get_initial_window(self, vel_range, v_central=None):
         """
@@ -647,10 +648,16 @@ class Spectrum(object):
             • The total combined model flux as a dashed pink line.
 
         Args:
-            ax (matplotlib.axes.Axes | None): Axes to draw into.  A new figure
-                                              is created when None (default).
+            ax (matplotlib.axes.Axes | None): Axes to draw into.  When None
+                                              (default) a new figure is created,
+                                              shown and closed; given axes are
+                                              left to the caller.
+
+        Returns:
+            ax (matplotlib.axes.Axes):        The axes drawn into.
         """
-        if ax is None:
+        own_fig = ax is None
+        if own_fig:
             fig, ax = plt.subplots(figsize=(12,3))
 
         x_val = self.wavelengths
@@ -669,8 +676,10 @@ class Spectrum(object):
         ax.set_ylim(-0.1, 1.1)
         ax.set_xlim(x_val[0], x_val[-1])
         ax.legend(loc='best', fontsize=8)
-        plt.show()
-        plt.close()
+        if own_fig:
+            plt.show()
+            plt.close(fig)
+        return ax
 
 
 def fit_profiles_sat(
